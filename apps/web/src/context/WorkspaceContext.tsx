@@ -1,6 +1,13 @@
 "use client";
 
-import React, { createContext, useContext, useEffect, useRef, useState } from "react";
+import React, {
+  createContext,
+  useContext,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
 import {
   AdjustmentState,
   HslAdjustments,
@@ -18,17 +25,21 @@ import { api } from "@/lib/api";
 import { importFiles } from "@/lib/imageImport";
 import { importReference as doImportReference } from "@/lib/referenceExtract";
 import { deleteExpiredSessions, getSession, saveSession } from "@/lib/sessionDb";
+import { computeBatchConsistency } from "@/lib/consistencyEngine";
+import { analyzeImageStats } from "@/lib/imageAnalysis";
 
 const MAX_REFERENCES = 3;
+
+function clamp(v: number, min: number, max: number) {
+  return Math.min(Math.max(v, min), max);
+}
 
 interface WorkspaceState {
   images: ImageRecord[];
   activeImageId: string | null;
   isImporting: boolean;
   importProgress: { current: number; total: number } | null;
-
   adjustments: AdjustmentState;
-
   hsl: HslAdjustments;
   sessionGenre: SessionGenre | null;
   sessionBrief: string;
@@ -42,6 +53,8 @@ interface WorkspaceState {
   clarificationQuestion: string | null;
   promptError: string | null;
   toasts: ToastItem[];
+  batchConsistencyScore: number;
+  isApplyingGrade: boolean;
 }
 
 interface WorkspaceActions {
@@ -61,9 +74,15 @@ interface WorkspaceActions {
   importReference: (file: File) => Promise<void>;
   removeReference: (id: string) => void;
   setReferenceWeight: (id: string, weight: number) => void;
-  setReferenceAttribute: (id: string, attr: keyof ReferenceImage["activeAttributes"], value: boolean) => void;
+  setReferenceAttribute: (
+    id: string,
+    attr: keyof ReferenceImage["activeAttributes"],
+    value: boolean
+  ) => void;
   addToast: (toast: Omit<ToastItem, "id">) => void;
   dismissToast: (id: string) => void;
+  applyGradeToAll: (sourceImageId: string) => Promise<void>;
+  unflagImage: (id: string) => void;
 }
 
 const WorkspaceContext = createContext<(WorkspaceState & WorkspaceActions) | null>(null);
@@ -77,7 +96,10 @@ export function WorkspaceProvider({ children, sessionId }: WorkspaceProviderProp
   const [images, setImages] = useState<ImageRecord[]>([]);
   const [activeImageId, setActiveImageId] = useState<string | null>(null);
   const [isImporting, setIsImporting] = useState(false);
-  const [importProgress, setImportProgress] = useState<{ current: number; total: number } | null>(null);
+  const [importProgress, setImportProgress] = useState<{
+    current: number;
+    total: number;
+  } | null>(null);
 
   const [hsl, setHslState] = useState<HslAdjustments>(defaultHslAdjustments);
   const [sessionGenre, setSessionGenreState] = useState<SessionGenre | null>(null);
@@ -93,6 +115,8 @@ export function WorkspaceProvider({ children, sessionId }: WorkspaceProviderProp
   const [clarificationQuestion, setClarificationQuestion] = useState<string | null>(null);
   const [promptError, setPromptError] = useState<string | null>(null);
   const [toasts, setToasts] = useState<ToastItem[]>([]);
+  const [batchConsistencyScore, setBatchConsistencyScore] = useState(100);
+  const [isApplyingGrade, setIsApplyingGrade] = useState(false);
 
   const saveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
@@ -126,6 +150,48 @@ export function WorkspaceProvider({ children, sessionId }: WorkspaceProviderProp
       .finally(() => setSessionRestored(true));
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  // ── Batch consistency engine (Section 6.2 + 6.4) ─────────────────────────
+  // Recompute only when adjustment fingerprints actually change, not when
+  // consistencyScore/flagged are updated, to avoid an infinite loop.
+
+  const adjustmentHash = useMemo(
+    () => images.map((img) => {
+      const a = img.adjustments;
+      return [a.exposure, a.contrast, a.highlights, a.shadows, a.whites,
+              a.blacks, a.clarity, a.vibrance, a.saturation, a.temperature, a.tint]
+        .map((v) => v.toFixed(2)).join(",");
+    }).join("|"),
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [images]
+  );
+
+  useEffect(() => {
+    if (!sessionRestored) return;
+
+    if (images.length < 2) {
+      setBatchConsistencyScore(100);
+      if (images.length === 1) {
+        setImages((prev) =>
+          prev.map((img) => ({ ...img, consistencyScore: 100, flagged: false }))
+        );
+      }
+      return;
+    }
+
+    const { batchScore, perImageScores, autoFlagged } = computeBatchConsistency(images);
+    setBatchConsistencyScore(batchScore);
+
+    setImages((prev) =>
+      prev.map((img) => ({
+        ...img,
+        consistencyScore: perImageScores[img.id] ?? img.consistencyScore,
+        flagged: autoFlagged.has(img.id),
+      }))
+    );
+  // adjustmentHash drives recalculation; sessionRestored gates it
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [adjustmentHash, sessionRestored]);
 
   // ── Auto-save: debounced 500ms after any state change ─────────────────────
 
@@ -236,6 +302,83 @@ export function WorkspaceProvider({ children, sessionId }: WorkspaceProviderProp
     }));
   };
 
+  // ── Batch: apply grade to all (Section 6.3) ───────────────────────────────
+
+  const applyGradeToAll = async (sourceImageId: string) => {
+    const sourceImage = images.find((img) => img.id === sourceImageId);
+    if (!sourceImage) return;
+
+    const targets = images.filter((img) => img.id !== sourceImageId);
+    if (!targets.length) return;
+
+    setIsApplyingGrade(true);
+    try {
+      // Client-side analysis: get luminance + color temp for source and each target
+      const sourceStats = await analyzeImageStats(sourceImage.originalDataUrl);
+      const targetStats = await Promise.all(
+        targets.map(async (img) => ({
+          image_id: img.id,
+          ...(await analyzeImageStats(img.originalDataUrl)),
+        }))
+      );
+
+      // Call adaptation API
+      const result = await api.batch.adaptGrade({
+        source_adjustments: sourceImage.adjustments,
+        source_stats: sourceStats,
+        targets: targetStats,
+      });
+
+      const deltaMap = new Map(result.adjustments.map((a) => [a.image_id, a.delta]));
+
+      setImages((prev) =>
+        prev.map((img) => {
+          if (img.id === sourceImageId) return img;
+          const d = deltaMap.get(img.id);
+          const src = sourceImage.adjustments;
+          const dExp = d?.exposure ?? 0;
+          const dTemp = d?.temperature ?? 0;
+          return {
+            ...img,
+            adjustments: {
+              exposure: clamp(src.exposure + dExp, -5, 5),
+              contrast: clamp(src.contrast + (d?.contrast ?? 0), -100, 100),
+              highlights: clamp(src.highlights + (d?.highlights ?? 0), -100, 100),
+              shadows: clamp(src.shadows + (d?.shadows ?? 0), -100, 100),
+              whites: clamp(src.whites + (d?.whites ?? 0), -100, 100),
+              blacks: clamp(src.blacks + (d?.blacks ?? 0), -100, 100),
+              clarity: clamp(src.clarity + (d?.clarity ?? 0), -100, 100),
+              vibrance: clamp(src.vibrance + (d?.vibrance ?? 0), -100, 100),
+              saturation: clamp(src.saturation + (d?.saturation ?? 0), -100, 100),
+              temperature: clamp(src.temperature + dTemp, 2000, 50000),
+              tint: clamp(src.tint + (d?.tint ?? 0), -150, 150),
+            },
+          };
+        })
+      );
+
+      addToast({
+        type: "success",
+        message: `Grade applied to ${targets.length} image${targets.length !== 1 ? "s" : ""}`,
+      });
+    } catch (err) {
+      addToast({
+        type: "error",
+        message: err instanceof Error ? err.message : "Failed to apply grade",
+      });
+    } finally {
+      setIsApplyingGrade(false);
+    }
+  };
+
+  // ── Batch: unflag (Section 6.4) ───────────────────────────────────────────
+
+  const unflagImage = (id: string) => {
+    setImages((prev) =>
+      prev.map((img) => (img.id === id ? { ...img, flagged: false } : img))
+    );
+  };
+
   // ── Prompt ────────────────────────────────────────────────────────────────
 
   const submitPrompt = async (text: string) => {
@@ -269,13 +412,18 @@ export function WorkspaceProvider({ children, sessionId }: WorkspaceProviderProp
         setImages((prev) =>
           prev.map((img) =>
             img.id === activeImageId
-              ? { ...img, adjustments: { ...img.adjustments, ...response.suggested_adjustments } }
+              ? {
+                  ...img,
+                  adjustments: { ...img.adjustments, ...response.suggested_adjustments },
+                }
               : img
           )
         );
       }
     } catch (err) {
-      setPromptError(err instanceof Error ? err.message : "Failed to process prompt");
+      setPromptError(
+        err instanceof Error ? err.message : "Failed to process prompt"
+      );
     } finally {
       setIsAnalyzing(false);
     }
@@ -287,7 +435,10 @@ export function WorkspaceProvider({ children, sessionId }: WorkspaceProviderProp
 
   const importReference = async (file: File) => {
     if (references.length >= MAX_REFERENCES) {
-      addToast({ type: "error", message: `Maximum ${MAX_REFERENCES} reference images allowed.` });
+      addToast({
+        type: "error",
+        message: `Maximum ${MAX_REFERENCES} reference images allowed.`,
+      });
       return;
     }
     try {
@@ -316,7 +467,9 @@ export function WorkspaceProvider({ children, sessionId }: WorkspaceProviderProp
   ) =>
     setReferences((prev) =>
       prev.map((r) =>
-        r.id === id ? { ...r, activeAttributes: { ...r.activeAttributes, [attr]: value } } : r
+        r.id === id
+          ? { ...r, activeAttributes: { ...r.activeAttributes, [attr]: value } }
+          : r
       )
     );
 
@@ -341,6 +494,8 @@ export function WorkspaceProvider({ children, sessionId }: WorkspaceProviderProp
         clarificationQuestion,
         promptError,
         toasts,
+        batchConsistencyScore,
+        isApplyingGrade,
         importImages,
         selectImage,
         setSessionGenre,
@@ -356,6 +511,8 @@ export function WorkspaceProvider({ children, sessionId }: WorkspaceProviderProp
         setReferenceAttribute,
         addToast,
         dismissToast,
+        applyGradeToAll,
+        unflagImage,
       }}
     >
       {children}

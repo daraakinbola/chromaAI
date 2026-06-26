@@ -1,12 +1,13 @@
 "use client";
 
-import { useRef } from "react";
+import { useEffect, useRef, useState } from "react";
 import { Flag, Grid2X2, List, Upload, Loader2 } from "lucide-react";
 import { clsx } from "clsx";
-import { useState } from "react";
 import { useWorkspace } from "@/context/WorkspaceContext";
 import { ACCEPTED_EXTENSIONS } from "@/lib/imageImport";
 import type { ImageRecord } from "@/types";
+
+// ── Consistency badge ─────────────────────────────────────────────────────────
 
 function ConsistencyBadge({ score }: { score: number }) {
   const color =
@@ -18,18 +19,85 @@ function ConsistencyBadge({ score }: { score: number }) {
   );
 }
 
+// ── Context menu ──────────────────────────────────────────────────────────────
+
+interface ContextMenuState {
+  imageId: string;
+  x: number;
+  y: number;
+}
+
+function ThumbnailContextMenu({
+  menu,
+  image,
+  onApplyGrade,
+  onUnflag,
+  onClose,
+}: {
+  menu: ContextMenuState;
+  image: ImageRecord | undefined;
+  onApplyGrade: () => void;
+  onUnflag: () => void;
+  onClose: () => void;
+}) {
+  const ref = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    const handler = (e: MouseEvent) => {
+      if (ref.current && !ref.current.contains(e.target as Node)) onClose();
+    };
+    document.addEventListener("mousedown", handler);
+    return () => document.removeEventListener("mousedown", handler);
+  }, [onClose]);
+
+  // Clamp so menu doesn't overflow viewport
+  const x = Math.min(menu.x, window.innerWidth - 200);
+  const y = Math.min(menu.y, window.innerHeight - 100);
+
+  return (
+    <div
+      ref={ref}
+      className="fixed z-50 bg-zinc-900 border border-zinc-700 rounded-lg shadow-xl py-1 min-w-[190px]"
+      style={{ left: x, top: y }}
+    >
+      <button
+        onClick={onApplyGrade}
+        className="w-full text-left px-3 py-1.5 text-xs text-zinc-300 hover:bg-zinc-800 transition-colors"
+      >
+        Apply this grade to all
+      </button>
+      {image?.flagged && (
+        <>
+          <div className="h-px bg-zinc-800 mx-2 my-1" />
+          <button
+            onClick={onUnflag}
+            className="w-full text-left px-3 py-1.5 text-xs text-zinc-300 hover:bg-zinc-800 transition-colors"
+          >
+            Unflag
+          </button>
+        </>
+      )}
+    </div>
+  );
+}
+
+// ── Thumbnail ─────────────────────────────────────────────────────────────────
+
 function Thumbnail({
   image,
   selected,
   onClick,
+  onContextMenu,
 }: {
   image: ImageRecord;
   selected: boolean;
   onClick: () => void;
+  onContextMenu: (e: React.MouseEvent) => void;
 }) {
   return (
     <button
       onClick={onClick}
+      onContextMenu={onContextMenu}
       className={clsx(
         "relative w-full aspect-[3/2] rounded overflow-hidden border transition-all",
         selected
@@ -61,6 +129,8 @@ function Thumbnail({
   );
 }
 
+// ── Empty state ───────────────────────────────────────────────────────────────
+
 function EmptyState({ onImport }: { onImport: () => void }) {
   return (
     <div className="flex-1 flex flex-col items-center justify-center px-4 py-8 gap-3">
@@ -80,32 +150,43 @@ function EmptyState({ onImport }: { onImport: () => void }) {
   );
 }
 
+// ── Main component ────────────────────────────────────────────────────────────
+
 export function ImageBrowser() {
-  const { images, activeImageId, selectImage, importImages, isImporting, importProgress } =
-    useWorkspace();
+  const {
+    images,
+    activeImageId,
+    selectImage,
+    importImages,
+    isImporting,
+    importProgress,
+    batchConsistencyScore,
+    applyGradeToAll,
+    unflagImage,
+    isApplyingGrade,
+  } = useWorkspace();
+
   const [layout, setLayout] = useState<"grid" | "list">("grid");
+  const [contextMenu, setContextMenu] = useState<ContextMenuState | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
   const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     const files = e.target.files;
-    if (files?.length) {
-      importImages(Array.from(files));
-    }
-    // Reset input so the same file can be re-imported if needed
+    if (files?.length) importImages(Array.from(files));
     e.target.value = "";
   };
 
   const openPicker = () => fileInputRef.current?.click();
 
+  const handleContextMenu = (e: React.MouseEvent, imageId: string) => {
+    e.preventDefault();
+    setContextMenu({ imageId, x: e.clientX, y: e.clientY });
+  };
+
   const flaggedCount = images.filter((i) => i.flagged).length;
-  const avgConsistency =
-    images.length > 0
-      ? Math.round(images.reduce((s, i) => s + i.consistencyScore, 0) / images.length)
-      : null;
 
   return (
     <aside className="flex flex-col h-full w-60 shrink-0 border-r border-zinc-800 bg-zinc-950">
-      {/* Hidden file input — Section 2.4 Step 1 */}
       <input
         ref={fileInputRef}
         type="file"
@@ -114,6 +195,23 @@ export function ImageBrowser() {
         className="hidden"
         onChange={handleFileChange}
       />
+
+      {/* Context menu portal */}
+      {contextMenu && (
+        <ThumbnailContextMenu
+          menu={contextMenu}
+          image={images.find((i) => i.id === contextMenu.imageId)}
+          onApplyGrade={() => {
+            applyGradeToAll(contextMenu.imageId);
+            setContextMenu(null);
+          }}
+          onUnflag={() => {
+            unflagImage(contextMenu.imageId);
+            setContextMenu(null);
+          }}
+          onClose={() => setContextMenu(null)}
+        />
+      )}
 
       {/* Header */}
       <div className="flex items-center justify-between px-3 py-2.5 border-b border-zinc-800 shrink-0">
@@ -151,39 +249,46 @@ export function ImageBrowser() {
         </div>
       </div>
 
-      {/* Batch consistency bar — only when images are loaded */}
-      {images.length > 0 && avgConsistency !== null && (
+      {/* Batch consistency bar — real score from Section 6.2 */}
+      {images.length > 0 && (
         <div className="px-3 py-2 border-b border-zinc-800/60">
           <div className="flex items-center justify-between mb-1">
             <span className="text-[10px] text-zinc-500 uppercase tracking-wider">
               Batch Consistency
             </span>
-            <span
-              className={clsx(
-                "text-[10px] font-mono",
-                avgConsistency >= 85
-                  ? "text-emerald-400"
-                  : avgConsistency >= 70
-                  ? "text-amber-400"
-                  : "text-red-400"
-              )}
-            >
-              {avgConsistency}%
-            </span>
+            {isApplyingGrade ? (
+              <Loader2 className="w-3 h-3 text-chroma-400 animate-spin" />
+            ) : (
+              <span
+                className={clsx(
+                  "text-[10px] font-mono",
+                  batchConsistencyScore >= 85
+                    ? "text-emerald-400"
+                    : batchConsistencyScore >= 70
+                    ? "text-amber-400"
+                    : "text-red-400"
+                )}
+              >
+                {batchConsistencyScore}%
+              </span>
+            )}
           </div>
           <div className="h-1 bg-zinc-800 rounded-full overflow-hidden">
             <div
               className={clsx(
-                "h-full rounded-full",
-                avgConsistency >= 85
+                "h-full rounded-full transition-all duration-300",
+                batchConsistencyScore >= 85
                   ? "bg-emerald-500/70"
-                  : avgConsistency >= 70
+                  : batchConsistencyScore >= 70
                   ? "bg-amber-500/70"
                   : "bg-red-500/70"
               )}
-              style={{ width: `${avgConsistency}%` }}
+              style={{ width: `${batchConsistencyScore}%` }}
             />
           </div>
+          {isApplyingGrade && (
+            <p className="text-[10px] text-zinc-500 mt-1">Applying grade…</p>
+          )}
         </div>
       )}
 
@@ -219,6 +324,7 @@ export function ImageBrowser() {
                 image={img}
                 selected={img.id === activeImageId}
                 onClick={() => selectImage(img.id)}
+                onContextMenu={(e) => handleContextMenu(e, img.id)}
               />
             ))}
           </div>
@@ -228,6 +334,7 @@ export function ImageBrowser() {
               <button
                 key={img.id}
                 onClick={() => selectImage(img.id)}
+                onContextMenu={(e) => handleContextMenu(e, img.id)}
                 className={clsx(
                   "flex items-center gap-2 px-2 py-1.5 rounded text-left transition-colors",
                   img.id === activeImageId
@@ -253,7 +360,9 @@ export function ImageBrowser() {
                   </p>
                 </div>
                 <ConsistencyBadge score={img.consistencyScore} />
-                {img.flagged && <Flag className="w-2.5 h-2.5 text-amber-400 shrink-0" />}
+                {img.flagged && (
+                  <Flag className="w-2.5 h-2.5 text-amber-400 shrink-0" />
+                )}
               </button>
             ))}
           </div>

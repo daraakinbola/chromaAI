@@ -100,3 +100,46 @@ class ImageMeta(BaseModel):
     format: Literal["RAW", "JPEG", "PNG", "TIFF"]
     consistency_score: Optional[float] = None
     flagged: bool = False
+
+
+# ── Batch processing (Section 6 of Phase 2 TechSpec) ─────────────────────────
+
+class AdjustmentDelta(BaseModel):
+    """Unclamped per-parameter delta applied on top of a source grade."""
+    exposure: float = 0.0
+    contrast: float = 0.0
+    highlights: float = 0.0
+    shadows: float = 0.0
+    whites: float = 0.0
+    blacks: float = 0.0
+    clarity: float = 0.0
+    vibrance: float = 0.0
+    saturation: float = 0.0
+    temperature: float = 0.0
+    tint: float = 0.0
+
+
+class ImageStats(BaseModel):
+    luminance: float = Field(..., ge=0.0, le=1.0, description="Average luminance 0–1")
+    colorTemperature: float = Field(..., ge=1000.0, le=50000.0, description="Estimated Kelvin")
+
+
+class BatchAdaptTarget(BaseModel):
+    image_id: str
+    luminance: float = Field(..., ge=0.0, le=1.0)
+    colorTemperature: float = Field(..., ge=1000.0, le=50000.0)
+
+
+class BatchAdaptRequest(BaseModel):
+    source_adjustments: Adjustments
+    source_stats: ImageStats
+    targets: list[BatchAdaptTarget]
+
+
+class ImageAdjustmentResult(BaseModel):
+    image_id: str
+    delta: AdjustmentDelta
+
+
+class BatchAdaptResponse(BaseModel):
+    adjustments: list[ImageAdjustmentResult]

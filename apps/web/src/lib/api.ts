@@ -1,4 +1,9 @@
-import type { PromptSubmitRequest, PromptSubmitResponse } from "@/types";
+import type {
+  BatchAdaptRequest,
+  BatchAdaptResponse,
+  PromptSubmitRequest,
+  PromptSubmitResponse,
+} from "@/types";
 
 const BASE = "/api";
 
@@ -45,6 +50,14 @@ export const api = {
   prompt: {
     submit: (req: PromptSubmitRequest) =>
       request<PromptSubmitResponse>("/prompt/submit", {
+        method: "POST",
+        body: JSON.stringify(req),
+      }),
+  },
+
+  batch: {
+    adaptGrade: (req: BatchAdaptRequest) =>
+      request<BatchAdaptResponse>("/batch/adapt-grade", {
         method: "POST",
         body: JSON.stringify(req),
       }),

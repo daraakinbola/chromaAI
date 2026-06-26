@@ -148,6 +148,48 @@ export interface ToastItem {
   message: string;
 }
 
+// ─── Batch processing (Section 6 of Phase 2 TechSpec) ────────────────────────
+
+export interface ImageStats {
+  luminance: number;
+  colorTemperature: number;
+}
+
+export interface BatchAdaptTarget {
+  image_id: string;
+  luminance: number;
+  colorTemperature: number;
+}
+
+export interface BatchAdaptRequest {
+  source_adjustments: AdjustmentState;
+  source_stats: ImageStats;
+  targets: BatchAdaptTarget[];
+}
+
+export interface AdjustmentDelta {
+  exposure: number;
+  contrast: number;
+  highlights: number;
+  shadows: number;
+  whites: number;
+  blacks: number;
+  clarity: number;
+  vibrance: number;
+  saturation: number;
+  temperature: number;
+  tint: number;
+}
+
+export interface ImageAdjustmentResult {
+  image_id: string;
+  delta: AdjustmentDelta;
+}
+
+export interface BatchAdaptResponse {
+  adjustments: ImageAdjustmentResult[];
+}
+
 // ─── Session persistence (Section 7 of Phase 2 TechSpec) ─────────────────────
 
 export interface SessionRecord {
