@@ -23,7 +23,7 @@ import {
 } from "@/types";
 import { api } from "@/lib/api";
 import { importFiles } from "@/lib/imageImport";
-import { importReference as doImportReference } from "@/lib/referenceExtract";
+import { applyReferencesToAdjustments, importReference as doImportReference } from "@/lib/referenceExtract";
 import { deleteExpiredSessions, getSession, saveSession } from "@/lib/sessionDb";
 import { computeBatchConsistency } from "@/lib/consistencyEngine";
 import { analyzeImageStats } from "@/lib/imageAnalysis";
@@ -55,6 +55,8 @@ interface WorkspaceState {
   toasts: ToastItem[];
   batchConsistencyScore: number;
   isApplyingGrade: boolean;
+  /** Base + all active reference contributions — what the canvas and export render. */
+  effectiveAdjustments: AdjustmentState;
 }
 
 interface WorkspaceActions {
@@ -122,6 +124,14 @@ export function WorkspaceProvider({ children, sessionId }: WorkspaceProviderProp
 
   const activeImage = images.find((i) => i.id === activeImageId);
   const adjustments = activeImage?.adjustments ?? defaultAdjustmentState;
+
+  // Spec Section 4.5: base + all active reference contributions.
+  // Reactive: recomputes whenever references or the active image's base adjustments change.
+  const effectiveAdjustments = useMemo(
+    () => applyReferencesToAdjustments(adjustments, references),
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [adjustments, references]
+  );
 
   // ── Session restore on mount ───────────────────────────────────────────────
 
@@ -496,6 +506,7 @@ export function WorkspaceProvider({ children, sessionId }: WorkspaceProviderProp
         toasts,
         batchConsistencyScore,
         isApplyingGrade,
+        effectiveAdjustments,
         importImages,
         selectImage,
         setSessionGenre,

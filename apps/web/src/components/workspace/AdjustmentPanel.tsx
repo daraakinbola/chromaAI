@@ -110,8 +110,9 @@ function ColorWheelPlaceholder({ label }: { label: string }) {
 }
 
 export function AdjustmentPanel() {
-  const { adjustments, setAdjustment, resetAdjustments, activeImageId } = useWorkspace();
+  const { adjustments, setAdjustment, resetAdjustments, activeImageId, references } = useWorkspace();
   const disabled = !activeImageId;
+  const activeRefs = references.filter((r) => r.weight > 0);
 
   const adj = (key: keyof AdjustmentState) => ({
     value: adjustments[key],
@@ -132,6 +133,16 @@ export function AdjustmentPanel() {
           Reset all
         </button>
       </div>
+
+      {/* Reference-active notice — sliders show base values; canvas adds ref contribution */}
+      {activeRefs.length > 0 && (
+        <div className="px-4 py-1.5 border-b border-zinc-800/60 bg-chroma-500/5">
+          <p className="text-[10px] text-chroma-400/80">
+            {activeRefs.length} reference{activeRefs.length !== 1 ? "s" : ""} active
+            {" "}· sliders show base values
+          </p>
+        </div>
+      )}
 
       {/* Scrollable sections */}
       <div className="flex-1 overflow-y-auto">

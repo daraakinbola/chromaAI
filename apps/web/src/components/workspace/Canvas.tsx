@@ -172,7 +172,7 @@ function useWebGLCanvas(
 // ─── Canvas component ─────────────────────────────────────────────────────────
 
 export function Canvas() {
-  const { images, activeImageId, viewMode, setViewMode, adjustments, importImages } =
+  const { images, activeImageId, viewMode, setViewMode, adjustments, effectiveAdjustments, importImages } =
     useWorkspace();
   const fileInputRef = useRef<HTMLInputElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
@@ -185,11 +185,11 @@ export function Canvas() {
 
   const activeImage = images.find((i) => i.id === activeImageId) ?? null;
 
-  // WebGL renderer
+  // WebGL renderer — renders effectiveAdjustments (base + reference contributions)
   const { isReady } = useWebGLCanvas(
     glCanvasRef,
     activeImage?.originalDataUrl ?? null,
-    adjustments
+    effectiveAdjustments
   );
 
   // Track container dimensions for containFit calculation
@@ -287,9 +287,9 @@ export function Canvas() {
           <div className="flex items-center gap-2 text-xs text-zinc-600">
             <span className="font-mono">
               {activeImage.width}×{activeImage.height}
-              &nbsp;·&nbsp;E:&nbsp;{adjustments.exposure > 0 ? "+" : ""}
-              {adjustments.exposure.toFixed(2)}
-              &nbsp;·&nbsp;{Math.round(adjustments.temperature)}K
+              &nbsp;·&nbsp;E:&nbsp;{effectiveAdjustments.exposure > 0 ? "+" : ""}
+              {effectiveAdjustments.exposure.toFixed(2)}
+              &nbsp;·&nbsp;{Math.round(effectiveAdjustments.temperature)}K
             </span>
             <div className="flex items-center gap-1 ml-2">
               <button className="p-1 rounded text-zinc-600 hover:text-zinc-300 hover:bg-zinc-800 transition-colors">

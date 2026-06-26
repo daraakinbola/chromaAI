@@ -6,21 +6,24 @@ import { useWorkspace } from "@/context/WorkspaceContext";
 import type { ReferenceImage } from "@/types";
 
 const ATTRIBUTE_LABELS: Record<keyof ReferenceImage["activeAttributes"], string> = {
-  toneCurve: "Tone",
+  toneCurve:        "Tone",
   colorTemperature: "Temp",
-  saturation: "Sat",
-  contrast: "Contrast",
-  shadowColor: "Shadows",
-  highlightColor: "Highlights",
+  saturation:       "Sat",
+  contrast:         "Contrast",
+  shadowColor:      "Shadows",
+  highlightColor:   "Highlights",
 };
 
-function ReferenceCard({ ref: r }: { ref: ReferenceImage }) {
+// `reference` instead of `ref` — React reserves `ref` as a special prop and
+// strips it before the component receives its props, which would leave the card
+// empty.
+function ReferenceCard({ reference: r }: { reference: ReferenceImage }) {
   const { removeReference, setReferenceWeight, setReferenceAttribute } = useWorkspace();
 
   return (
-    <div className="flex flex-col gap-1.5 p-2 rounded-lg border border-zinc-800 bg-zinc-900/60 min-w-0">
+    <div className="flex flex-col gap-1.5 p-2 rounded-lg border border-zinc-800 bg-zinc-900/60 shrink-0">
       {/* Thumbnail + remove */}
-      <div className="relative w-[120px] h-[80px] rounded overflow-hidden shrink-0 group">
+      <div className="relative w-[120px] h-[80px] rounded overflow-hidden group">
         {/* eslint-disable-next-line @next/next/no-img-element */}
         <img
           src={r.thumbnailDataUrl}
@@ -93,7 +96,7 @@ export function ReferenceStrip() {
       </div>
       <div className="flex items-start gap-2 overflow-x-auto pb-0.5">
         {references.map((r) => (
-          <ReferenceCard key={r.id} ref={r} />
+          <ReferenceCard key={r.id} reference={r} />
         ))}
       </div>
     </div>

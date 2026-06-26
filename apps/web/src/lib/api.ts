@@ -62,4 +62,12 @@ export const api = {
         body: JSON.stringify(req),
       }),
   },
+
+  reference: {
+    extract: (dataUrl: string) =>
+      request<{ color_profile: unknown }>("/reference/extract", {
+        method: "POST",
+        body: JSON.stringify({ data_url: dataUrl }),
+      }),
+  },
 };

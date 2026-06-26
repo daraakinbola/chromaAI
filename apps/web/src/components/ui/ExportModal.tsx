@@ -4,6 +4,7 @@ import { useState } from "react";
 import { X, Download, Loader2, Archive } from "lucide-react";
 import { clsx } from "clsx";
 import { useWorkspace } from "@/context/WorkspaceContext";
+import { applyReferencesToAdjustments } from "@/lib/referenceExtract";
 import {
   exportImage,
   batchExportImages,
@@ -80,7 +81,7 @@ function BatchProgressBar({ done, total }: { done: number; total: number }) {
 // ─── Modal ────────────────────────────────────────────────────────────────────
 
 export function ExportModal({ onClose }: { onClose: () => void }) {
-  const { images, activeImageId } = useWorkspace();
+  const { images, activeImageId, references, effectiveAdjustments } = useWorkspace();
   const activeImage = images.find((i) => i.id === activeImageId);
 
   const [scope, setScope]           = useState<ExportScope>("active");
@@ -93,11 +94,13 @@ export function ExportModal({ onClose }: { onClose: () => void }) {
 
   const isBatch = scope === "all";
   const ext = format === "image/png" ? "png" : format === "image/webp" ? "webp" : "jpg";
-  const outputFilename = activeImage
+  const singleFilename = activeImage
     ? `${activeImage.filename.replace(/\.[^.]+$/, "")}_chromaai.${ext}`
     : "";
   const timestamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
   const zipFilename = `chromaai_export_${timestamp}.zip`;
+
+  const hasReferences = references.some((r) => r.weight > 0);
 
   const handleExport = async () => {
     setExporting(true);
@@ -106,14 +109,23 @@ export function ExportModal({ onClose }: { onClose: () => void }) {
 
     try {
       if (isBatch) {
+        // Pre-patch each image's adjustments with effective (base + references)
+        // so batchExportImages renders the same look as the canvas preview.
+        const patchedImages = references.length > 0
+          ? images.map((img) => ({
+              ...img,
+              adjustments: applyReferencesToAdjustments(img.adjustments, references),
+            }))
+          : images;
         await batchExportImages(
-          images,
+          patchedImages,
           { format, quality, resolution },
           (done, total) => setProgress({ done, total })
         );
       } else {
         if (!activeImage) return;
-        await exportImage(activeImage, { format, quality, resolution });
+        // effectiveAdjustments already reflects base + active reference contributions
+        await exportImage(activeImage, { format, quality, resolution }, effectiveAdjustments);
       }
       onClose();
     } catch (e) {
@@ -125,7 +137,10 @@ export function ExportModal({ onClose }: { onClose: () => void }) {
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center">
-      <div className="absolute inset-0 bg-black/70" onClick={exporting ? undefined : onClose} />
+      <div
+        className="absolute inset-0 bg-black/70"
+        onClick={exporting ? undefined : onClose}
+      />
 
       <div
         className="relative z-10 w-[22rem] bg-zinc-900 border border-zinc-700 rounded-xl shadow-2xl overflow-hidden"
@@ -138,7 +153,7 @@ export function ExportModal({ onClose }: { onClose: () => void }) {
             <p className="text-[11px] text-zinc-500 mt-0.5">
               {isBatch
                 ? `${images.length} image${images.length !== 1 ? "s" : ""} · ZIP archive`
-                : activeImage?.filename ?? "No image selected"}
+                : (activeImage?.filename ?? "No image selected")}
             </p>
           </div>
           <button
@@ -204,7 +219,7 @@ export function ExportModal({ onClose }: { onClose: () => void }) {
               {/* Resolution */}
               <OptionGroup label="Resolution">
                 <RadioPill
-                  label={`Full (${activeImage ? `${activeImage.width}×${activeImage.height}` : "original"})`}
+                  label={`Full${activeImage ? ` (${activeImage.width}×${activeImage.height})` : ""}`}
                   selected={resolution === "full"}
                   onClick={() => setResolution("full")}
                 />
@@ -218,7 +233,7 @@ export function ExportModal({ onClose }: { onClose: () => void }) {
                   {isBatch ? "ZIP archive" : "Output filename"}
                 </p>
                 <p className="text-xs font-mono text-zinc-400 truncate">
-                  {isBatch ? zipFilename : outputFilename}
+                  {isBatch ? zipFilename : singleFilename}
                 </p>
                 {isBatch && (
                   <p className="text-[10px] text-zinc-600 mt-0.5">
@@ -227,6 +242,13 @@ export function ExportModal({ onClose }: { onClose: () => void }) {
                   </p>
                 )}
               </div>
+
+              {/* Reference active notice */}
+              {hasReferences && (
+                <p className="text-[10px] text-chroma-400/80 bg-chroma-500/8 border border-chroma-500/20 rounded px-2.5 py-1.5">
+                  {references.filter((r) => r.weight > 0).length} reference{references.filter((r) => r.weight > 0).length !== 1 ? "s" : ""} active · effect baked into export
+                </p>
+              )}
 
               {/* Batch progress */}
               {exporting && progress && (
@@ -263,9 +285,7 @@ export function ExportModal({ onClose }: { onClose: () => void }) {
                 {exporting ? (
                   <>
                     <Loader2 className="w-3.5 h-3.5 animate-spin" />
-                    {progress
-                      ? `${progress.done} of ${progress.total}`
-                      : "Preparing…"}
+                    {progress ? `${progress.done} of ${progress.total}` : "Preparing…"}
                   </>
                 ) : isBatch ? (
                   <>

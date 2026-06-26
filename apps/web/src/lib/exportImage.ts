@@ -1,6 +1,6 @@
 import JSZip from "jszip";
 import { WebGLRenderer, webglSupported } from "@/lib/webglRenderer";
-import type { ImageRecord } from "@/types";
+import type { AdjustmentState, ImageRecord } from "@/types";
 
 export type ExportFormat = "image/jpeg" | "image/png" | "image/webp";
 export type ExportResolution = "full" | "2k" | "1080p";
@@ -40,38 +40,34 @@ function triggerDownload(blob: Blob, filename: string): void {
   document.body.appendChild(a);
   a.click();
   document.body.removeChild(a);
-  // Revoke after a tick so the browser has time to start the download
   setTimeout(() => URL.revokeObjectURL(url), 1000);
 }
 
 // ─── Core render-to-blob ──────────────────────────────────────────────────────
 
 /**
- * Renders one ImageRecord with its current adjustments to a Blob.
+ * Renders one image to a Blob using the provided adjustments.
  *
- * Spec Section 5.3 Step 2–4:
- *   - Full-resolution offscreen canvas at the target export dimensions.
- *   - WebGL shader applies all AdjustmentState values (CSS-filter fallback for
- *     browsers without WebGL).
- *   - canvas.toBlob() at the requested format/quality.
+ * `adjustments` is passed explicitly — callers supply effectiveAdjustments
+ * (base + reference contributions) so that reference effects are baked into
+ * exports, matching what the canvas preview shows (spec Section 5.5).
  */
 async function renderToBlob(
   image: ImageRecord,
-  options: ExportOptions
+  options: ExportOptions,
+  adjustments: AdjustmentState
 ): Promise<Blob> {
   const { format, quality, resolution } = options;
   const { width, height } = resolveResolution(image.width, image.height, resolution);
 
   if (webglSupported()) {
-    // ── WebGL path ────────────────────────────────────────────────────────────
     const canvas = document.createElement("canvas");
     canvas.width = width;
     canvas.height = height;
-
     const renderer = new WebGLRenderer(canvas);
     try {
       await renderer.loadImage(image.originalDataUrl);
-      renderer.drawSync(image.adjustments);
+      renderer.drawSync(adjustments);
       return await new Promise<Blob>((resolve, reject) => {
         canvas.toBlob(
           (b) => (b ? resolve(b) : reject(new Error("toBlob returned null"))),
@@ -83,25 +79,22 @@ async function renderToBlob(
       renderer.destroy();
     }
   } else {
-    // ── CSS-filter fallback ───────────────────────────────────────────────────
+    // CSS-filter fallback for browsers without WebGL
     const { buildCssFilter } = await import("@/lib/cssFilters");
     const canvas = document.createElement("canvas");
     canvas.width = width;
     canvas.height = height;
     const ctx = canvas.getContext("2d");
     if (!ctx) throw new Error("Could not get 2D canvas context");
-
     const img = new Image();
     await new Promise<void>((resolve, reject) => {
       img.onload = () => resolve();
       img.onerror = () => reject(new Error("Failed to load image for export"));
       img.src = image.originalDataUrl;
     });
-
-    const filterStr = buildCssFilter(image.adjustments);
+    const filterStr = buildCssFilter(adjustments);
     if (filterStr !== "none") ctx.filter = filterStr;
     ctx.drawImage(img, 0, 0, width, height);
-
     return new Promise<Blob>((resolve, reject) => {
       canvas.toBlob(
         (b) => (b ? resolve(b) : reject(new Error("toBlob returned null"))),
@@ -115,21 +108,24 @@ async function renderToBlob(
 // ─── Public API ───────────────────────────────────────────────────────────────
 
 /**
- * Spec Section 5.3: Export the active image and trigger a browser download.
+ * Spec Section 5.3: export the active image and trigger a browser download.
+ * Pass `effectiveAdjustments` from WorkspaceContext to bake in reference effects.
  */
-export async function exportImage(image: ImageRecord, options: ExportOptions): Promise<void> {
-  const blob = await renderToBlob(image, options);
+export async function exportImage(
+  image: ImageRecord,
+  options: ExportOptions,
+  adjustments: AdjustmentState
+): Promise<void> {
+  const blob = await renderToBlob(image, options, adjustments);
   triggerDownload(blob, outputFilename(image, options.format));
 }
 
 /**
- * Spec Section 5.4: Batch export — processes every ImageRecord sequentially
- * through the WebGL pipeline, packages all output blobs into a ZIP, and
- * triggers a single browser download.
+ * Spec Section 5.4: batch export.
  *
- * @param images  All session images
- * @param options Export format/quality/resolution
- * @param onProgress  Called after each image completes with (done, total)
+ * Each image in `images` should already have its effective adjustments set
+ * (i.e., `image.adjustments = applyReferencesToAdjustments(base, refs)`).
+ * ExportModal pre-patches the array before calling this function.
  */
 export async function batchExportImages(
   images: ImageRecord[],
@@ -141,13 +137,13 @@ export async function batchExportImages(
 
   for (let i = 0; i < images.length; i++) {
     const image = images[i];
-    const blob = await renderToBlob(image, options);
+    const blob = await renderToBlob(image, options, image.adjustments);
     zip.file(outputFilename(image, options.format), blob);
     onProgress(i + 1, total);
   }
 
-  // Images are already compressed formats — STORE avoids double-compression
-  // overhead and keeps the 30-second budget for large batches (spec 5.5).
+  // JPEG/PNG/WebP are already compressed — STORE avoids double-compression
+  // and keeps batch of 10×10MB within the 30s spec budget (Section 5.5).
   const zipBlob = await zip.generateAsync({ type: "blob", compression: "STORE" });
   const timestamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
   triggerDownload(zipBlob, `chromaai_export_${timestamp}.zip`);
