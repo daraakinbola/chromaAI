@@ -10,6 +10,7 @@ import React, {
 } from "react";
 import {
   AdjustmentState,
+  ColorWheelState,
   HslAdjustments,
   ImageRecord,
   PromptEntry,
@@ -19,7 +20,9 @@ import {
   SessionRecord,
   ToastItem,
   ViewMode,
+  WheelState,
   defaultAdjustmentState,
+  defaultColorWheelState,
   defaultHslAdjustments,
 } from "@/types";
 import { api } from "@/lib/api";
@@ -42,6 +45,7 @@ interface WorkspaceState {
   importProgress: { current: number; total: number } | null;
   adjustments: AdjustmentState;
   hsl: HslAdjustments;
+  colorWheels: ColorWheelState;
   sessionGenre: SessionGenre | null;
   sessionBrief: string;
   sessionRestored: boolean;
@@ -71,6 +75,8 @@ interface WorkspaceActions {
     channel: keyof HslAdjustments[keyof HslAdjustments],
     value: number
   ) => void;
+  setColorWheel: (zone: keyof ColorWheelState, value: WheelState) => void;
+  resetColorWheel: (zone: keyof ColorWheelState) => void;
   setViewMode: (mode: ViewMode) => void;
   submitPrompt: (text: string) => Promise<void>;
   dismissInterpretation: () => void;
@@ -105,6 +111,7 @@ export function WorkspaceProvider({ children, sessionId }: WorkspaceProviderProp
   } | null>(null);
 
   const [hsl, setHslState] = useState<HslAdjustments>(defaultHslAdjustments);
+  const [colorWheels, setColorWheelsState] = useState<ColorWheelState>(defaultColorWheelState);
   const [sessionGenre, setSessionGenreState] = useState<SessionGenre | null>(null);
   const [sessionBrief, setSessionBrief] = useState("");
   const [sessionCreatedAt, setSessionCreatedAt] = useState(Date.now());
@@ -150,6 +157,7 @@ export function WorkspaceProvider({ children, sessionId }: WorkspaceProviderProp
           setImages(record.images);
           setActiveImageId(record.activeImageId);
           setHslState(record.hsl);
+          if (record.colorWheels) setColorWheelsState(record.colorWheels);
           setSessionGenreState(record.genre);
           setSessionBrief(record.brief);
           setReferences(record.references);
@@ -254,6 +262,7 @@ export function WorkspaceProvider({ children, sessionId }: WorkspaceProviderProp
         references,
         promptHistory,
         hsl,
+        colorWheels,
         thumbnailDataUrl: images[0]?.thumbnailDataUrl ?? null,
       };
       saveSession(record).catch(console.error);
@@ -263,7 +272,7 @@ export function WorkspaceProvider({ children, sessionId }: WorkspaceProviderProp
       if (saveTimerRef.current) clearTimeout(saveTimerRef.current);
     };
   }, [
-    images, activeImageId, references, promptHistory, hsl,
+    images, activeImageId, references, promptHistory, hsl, colorWheels,
     sessionGenre, sessionBrief, sessionRestored, sessionId,
     sessionCreatedAt,
   ]);
@@ -341,6 +350,17 @@ export function WorkspaceProvider({ children, sessionId }: WorkspaceProviderProp
     setHslState((prev) => ({
       ...prev,
       [color]: { ...prev[color], [channel]: value },
+    }));
+  };
+
+  const setColorWheel = (zone: keyof ColorWheelState, value: WheelState) => {
+    setColorWheelsState((prev) => ({ ...prev, [zone]: value }));
+  };
+
+  const resetColorWheel = (zone: keyof ColorWheelState) => {
+    setColorWheelsState((prev) => ({
+      ...prev,
+      [zone]: { hue: 0, saturation: 0, luminance: 0 },
     }));
   };
 
@@ -525,6 +545,7 @@ export function WorkspaceProvider({ children, sessionId }: WorkspaceProviderProp
         importProgress,
         adjustments,
         hsl,
+        colorWheels,
         sessionGenre,
         sessionBrief,
         sessionRestored,
@@ -546,6 +567,8 @@ export function WorkspaceProvider({ children, sessionId }: WorkspaceProviderProp
         setAdjustment,
         resetAdjustments,
         setHsl,
+        setColorWheel,
+        resetColorWheel,
         setViewMode,
         submitPrompt,
         dismissInterpretation,

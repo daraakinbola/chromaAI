@@ -81,6 +81,11 @@ export async function createSession(
       purple:  { hue: 0, saturation: 0, luminance: 0 },
       magenta: { hue: 0, saturation: 0, luminance: 0 },
     },
+    colorWheels: {
+      lift:  { hue: 0, saturation: 0, luminance: 0 },
+      gamma: { hue: 0, saturation: 0, luminance: 0 },
+      gain:  { hue: 0, saturation: 0, luminance: 0 },
+    },
     thumbnailDataUrl: null,
   };
   await saveSession(record);

@@ -12,7 +12,8 @@ import { clsx } from "clsx";
 import { useWorkspace } from "@/context/WorkspaceContext";
 import { ACCEPTED_EXTENSIONS } from "@/lib/imageImport";
 import { WebGLRenderer, webglSupported } from "@/lib/webglRenderer";
-import type { AdjustmentState, HslAdjustments, ViewMode } from "@/types";
+import type { AdjustmentState, ColorWheelState, HslAdjustments, ViewMode } from "@/types";
+import { defaultColorWheelState } from "@/types";
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
@@ -110,7 +111,8 @@ function useWebGLCanvas(
   canvasRef: React.RefObject<HTMLCanvasElement | null>,
   imageSrc: string | null,
   adjustments: AdjustmentState,
-  hsl: HslAdjustments
+  hsl: HslAdjustments,
+  colorWheels: ColorWheelState
 ): { isReady: boolean } {
   const rendererRef = useRef<WebGLRenderer | null>(null);
   const [isReady, setIsReady] = useState(false);
@@ -118,6 +120,8 @@ function useWebGLCanvas(
   adjRef.current = adjustments;
   const hslRef = useRef(hsl);
   hslRef.current = hsl;
+  const wheelsRef = useRef(colorWheels);
+  wheelsRef.current = colorWheels;
 
   // Destroy renderer on unmount only
   useEffect(() => {
@@ -137,7 +141,7 @@ function useWebGLCanvas(
       if (w && h && (canvas.width !== w || canvas.height !== h)) {
         canvas.width = w;
         canvas.height = h;
-        if (isReady) rendererRef.current?.render(adjRef.current, hslRef.current);
+        if (isReady) rendererRef.current?.render(adjRef.current, hslRef.current, wheelsRef.current);
       }
     });
     obs.observe(canvas);
@@ -174,9 +178,9 @@ function useWebGLCanvas(
   // Re-render when adjustments or HSL change (RAF-batched inside renderer)
   useEffect(() => {
     if (!isReady) return;
-    rendererRef.current?.render(adjustments, hsl);
+    rendererRef.current?.render(adjustments, hsl, colorWheels);
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [adjustments, hsl, isReady]);
+  }, [adjustments, hsl, colorWheels, isReady]);
 
   return { isReady };
 }
@@ -184,7 +188,7 @@ function useWebGLCanvas(
 // ─── Canvas component ─────────────────────────────────────────────────────────
 
 export function Canvas() {
-  const { images, activeImageId, viewMode, setViewMode, adjustments, effectiveAdjustments, hsl, importImages } =
+  const { images, activeImageId, viewMode, setViewMode, adjustments, effectiveAdjustments, hsl, colorWheels, importImages } =
     useWorkspace();
   const fileInputRef = useRef<HTMLInputElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
@@ -209,12 +213,13 @@ export function Canvas() {
 
   const activeImage = images.find((i) => i.id === activeImageId) ?? null;
 
-  // WebGL renderer — renders effectiveAdjustments + HSL
+  // WebGL renderer — renders effectiveAdjustments + HSL + color wheels
   const { isReady } = useWebGLCanvas(
     glCanvasRef,
     activeImage?.originalDataUrl ?? null,
     effectiveAdjustments,
-    hsl
+    hsl,
+    colorWheels
   );
 
   // Track container dimensions for containFit calculation and split clip math

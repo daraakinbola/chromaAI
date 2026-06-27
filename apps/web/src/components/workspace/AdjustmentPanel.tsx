@@ -4,6 +4,7 @@ import { useState } from "react";
 import { ChevronDown, RotateCcw } from "lucide-react";
 import { clsx } from "clsx";
 import { Slider } from "@/components/ui/Slider";
+import { ColorWheel } from "@/components/ui/ColorWheel";
 import { useWorkspace } from "@/context/WorkspaceContext";
 import { AdjustmentState, HslColor } from "@/types";
 
@@ -96,15 +97,20 @@ function ToneCurvePlaceholder() {
   );
 }
 
-function ColorWheelPlaceholder({ label }: { label: string }) {
+function ColorWheelSection({ disabled }: { disabled: boolean }) {
+  const { colorWheels, setColorWheel, resetColorWheel } = useWorkspace();
   return (
-    <div className="flex flex-col items-center gap-1">
-      <div className="w-16 h-16 rounded-full border border-zinc-700 bg-zinc-900 flex items-center justify-center">
-        <div className="w-12 h-12 rounded-full" style={{
-          background: "conic-gradient(from 0deg, #ef4444, #f97316, #eab308, #22c55e, #06b6d4, #3b82f6, #a855f7, #ec4899, #ef4444)"
-        }} />
-      </div>
-      <span className="text-[9px] text-zinc-600 uppercase tracking-wider">{label}</span>
+    <div className="flex items-start justify-between gap-1">
+      {(["lift", "gamma", "gain"] as const).map((zone) => (
+        <ColorWheel
+          key={zone}
+          label={zone}
+          value={colorWheels[zone]}
+          onChange={(v) => setColorWheel(zone, v)}
+          onReset={() => resetColorWheel(zone)}
+          disabled={disabled}
+        />
+      ))}
     </div>
   );
 }
@@ -171,12 +177,7 @@ export function AdjustmentPanel() {
         <HslSection />
 
         <Section title="Color Wheels" defaultOpen={false}>
-          <p className="text-[10px] text-zinc-600 mb-2">Lift / Gamma / Gain</p>
-          <div className="flex items-start justify-between">
-            <ColorWheelPlaceholder label="Lift" />
-            <ColorWheelPlaceholder label="Gamma" />
-            <ColorWheelPlaceholder label="Gain" />
-          </div>
+          <ColorWheelSection disabled={disabled} />
         </Section>
 
         {/* AI override disclosure */}

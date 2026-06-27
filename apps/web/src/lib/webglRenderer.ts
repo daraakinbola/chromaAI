@@ -25,8 +25,8 @@
  */
 
 import * as twgl from "twgl.js";
-import type { AdjustmentState, HslAdjustments } from "@/types";
-import { defaultHslAdjustments } from "@/types";
+import type { AdjustmentState, HslAdjustments, ColorWheelState, WheelState } from "@/types";
+import { defaultHslAdjustments, defaultColorWheelState } from "@/types";
 
 // ─── Shaders ─────────────────────────────────────────────────────────────────
 
@@ -66,6 +66,16 @@ const FS = /* glsl */ `
   // Per-channel HSL: 8 bands (Red, Orange, Yellow, Green, Aqua, Blue, Purple, Magenta)
   // Each vec3 = (hue_shift, sat_delta, lum_delta) all normalised to −1..+1
   uniform vec3 u_hsl[8];
+
+  // Lift / Gamma / Gain — zone-weighted colour offsets (pre-computed in JS)
+  // u_*_color: RGB delta centred at 0 (computed from wheel hue+saturation)
+  // u_*_lum:   scalar luminance delta
+  uniform vec3  u_lift_color;
+  uniform vec3  u_gamma_color;
+  uniform vec3  u_gain_color;
+  uniform float u_lift_lum;
+  uniform float u_gamma_lum;
+  uniform float u_gain_lum;
 
   // ── RGB ↔ HSL ─────────────────────────────────────────────────────────────
   vec3 rgb2hsl(vec3 c) {
@@ -245,7 +255,24 @@ const FS = /* glsl */ `
       }
     }
 
-    // ── 13. Clarity (spec: unsharp mask at medium radius) ─────────────────
+    // ── 13. Lift / Gamma / Gain (zone-weighted additive blending) ─────────
+    // Quadratic zone weights of Rec.709 luminance L:
+    //   lift  (1−L)²   peaks at L=0 (shadows)
+    //   gamma 4L(1−L)  peaks at L=0.5 (midtones, max weight = 1)
+    //   gain  L²       peaks at L=1 (highlights)
+    // JS pre-scales u_*_color by 0.5 (max ±0.25 per channel at full sat)
+    // and u_*_lum by 0.3 for comfortable range.
+    {
+      float lggL = dot(rgb, vec3(0.2126, 0.7152, 0.0722));
+      float wL = (1.0 - lggL) * (1.0 - lggL);
+      float wM = 4.0 * lggL * (1.0 - lggL);
+      float wH = lggL * lggL;
+      rgb += u_lift_color  * wL + u_gamma_color * wM + u_gain_color * wH;
+      rgb += vec3(u_lift_lum * wL + u_gamma_lum * wM + u_gain_lum * wH);
+      rgb  = clamp(rgb, 0.0, 1.0);
+    }
+
+    // ── 14. Clarity (spec: unsharp mask at medium radius) ─────────────────
     if (abs(u_clarity) > 0.01) {
       // 5-tap cross blur at medium radius (~20 image-space pixels)
       float R = 20.0;
@@ -294,6 +321,35 @@ function flattenHsl(hsl: HslAdjustments): number[] {
   ]);
 }
 
+// ─── Lift / Gamma / Gain helpers ─────────────────────────────────────────────
+
+function _h2r(p: number, q: number, t: number): number {
+  if (t < 0) t += 1;
+  if (t > 1) t -= 1;
+  if (t < 1 / 6) return p + (q - p) * 6 * t;
+  if (t < 0.5)   return q;
+  if (t < 2 / 3) return p + (q - p) * (2 / 3 - t) * 6;
+  return p;
+}
+
+function hsl01ToRgb(h01: number, s: number, l: number): [number, number, number] {
+  if (s === 0) return [l, l, l];
+  const q = l < 0.5 ? l * (1 + s) : l + s - l * s;
+  const p = 2 * l - q;
+  return [_h2r(p, q, h01 + 1 / 3), _h2r(p, q, h01), _h2r(p, q, h01 - 1 / 3)];
+}
+
+/** Convert a WheelState to the uniform values passed to the shader. */
+function wheelUniforms(w: WheelState): { color: [number, number, number]; lum: number } {
+  const [r, g, b] = hsl01ToRgb(w.hue / 360, w.saturation, 0.5);
+  // Offset from neutral (0.5, 0.5, 0.5).
+  // Scale by 0.5 → max ±0.25 per channel at saturation=1.
+  return {
+    color: [(r - 0.5) * 0.5, (g - 0.5) * 0.5, (b - 0.5) * 0.5],
+    lum: w.luminance * 0.3,
+  };
+}
+
 // ─── WebGLRenderer ───────────────────────────────────────────────────────────
 
 export class WebGLRenderer {
@@ -309,6 +365,7 @@ export class WebGLRenderer {
   /** Latest-pending state for RAF batching. */
   private pendingAdj: AdjustmentState | null = null;
   private pendingHsl: HslAdjustments = defaultHslAdjustments;
+  private pendingWheels: ColorWheelState = defaultColorWheelState;
   private rafId: number | null = null;
 
   constructor(canvas: HTMLCanvasElement) {
@@ -363,14 +420,16 @@ export class WebGLRenderer {
    */
   render(
     adj: AdjustmentState = DEFAULT_ADJ,
-    hsl: HslAdjustments = defaultHslAdjustments
+    hsl: HslAdjustments = defaultHslAdjustments,
+    colorWheels: ColorWheelState = defaultColorWheelState
   ): void {
     this.pendingAdj = adj;
     this.pendingHsl = hsl;
+    this.pendingWheels = colorWheels;
     if (this.rafId !== null) return; // already queued
     this.rafId = requestAnimationFrame(() => {
       this.rafId = null;
-      if (this.pendingAdj) this._draw(this.pendingAdj, this.pendingHsl);
+      if (this.pendingAdj) this._draw(this.pendingAdj, this.pendingHsl, this.pendingWheels);
       this.pendingAdj = null;
     });
   }
@@ -378,16 +437,17 @@ export class WebGLRenderer {
   /** Synchronous draw — use only when you need the result immediately (e.g., export). */
   drawSync(
     adj: AdjustmentState = DEFAULT_ADJ,
-    hsl: HslAdjustments = defaultHslAdjustments
+    hsl: HslAdjustments = defaultHslAdjustments,
+    colorWheels: ColorWheelState = defaultColorWheelState
   ): void {
     if (this.rafId !== null) {
       cancelAnimationFrame(this.rafId);
       this.rafId = null;
     }
-    this._draw(adj, hsl);
+    this._draw(adj, hsl, colorWheels);
   }
 
-  private _draw(adj: AdjustmentState, hsl: HslAdjustments): void {
+  private _draw(adj: AdjustmentState, hsl: HslAdjustments, colorWheels: ColorWheelState): void {
     const gl = this.gl;
     if (!this.texture) return;
 
@@ -402,6 +462,10 @@ export class WebGLRenderer {
 
     gl.useProgram(this.programInfo.program);
     twgl.setBuffersAndAttributes(gl, this.programInfo, this.bufferInfo);
+    const lift  = wheelUniforms(colorWheels.lift);
+    const gamma = wheelUniforms(colorWheels.gamma);
+    const gain  = wheelUniforms(colorWheels.gain);
+
     twgl.setUniforms(this.programInfo, {
       u_image:        this.texture,
       u_texelSize:    [1 / this.texW, 1 / this.texH],
@@ -419,6 +483,12 @@ export class WebGLRenderer {
       u_temperature:  adj.temperature,
       u_tint:         adj.tint,
       u_hsl:          flattenHsl(hsl),
+      u_lift_color:   lift.color,
+      u_gamma_color:  gamma.color,
+      u_gain_color:   gain.color,
+      u_lift_lum:     lift.lum,
+      u_gamma_lum:    gamma.lum,
+      u_gain_lum:     gain.lum,
     });
     twgl.drawBufferInfo(gl, this.bufferInfo);
   }

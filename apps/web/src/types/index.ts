@@ -59,6 +59,26 @@ export const defaultAdjustmentState: AdjustmentState = {
 
 export const defaultAdjustments = defaultAdjustmentState;
 
+// ─── Color Wheels — Lift / Gamma / Gain ─────────────────────────────────────
+
+export interface WheelState {
+  hue: number;        // 0–360 ° (0 = top/12-o'clock = red, clockwise)
+  saturation: number; // 0–1  (0 = centre = no colour shift)
+  luminance: number;  // −1 … +1 (zone luminance offset)
+}
+
+export interface ColorWheelState {
+  lift:  WheelState;  // shadows zone
+  gamma: WheelState;  // midtones zone
+  gain:  WheelState;  // highlights zone
+}
+
+export const defaultColorWheelState: ColorWheelState = {
+  lift:  { hue: 0, saturation: 0, luminance: 0 },
+  gamma: { hue: 0, saturation: 0, luminance: 0 },
+  gain:  { hue: 0, saturation: 0, luminance: 0 },
+};
+
 // ─── HSL (not in spec AdjustmentState — kept as separate workspace state) ───
 
 export interface HslChannel {
@@ -215,5 +235,6 @@ export interface SessionRecord {
   references: ReferenceImage[];
   promptHistory: PromptEntry[];
   hsl: HslAdjustments;
+  colorWheels: ColorWheelState;
   thumbnailDataUrl: string | null;
 }
