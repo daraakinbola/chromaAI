@@ -99,12 +99,20 @@ function ToneCurvePlaceholder() {
 
 function ColorWheelSection({ disabled }: { disabled: boolean }) {
   const { colorWheels, setColorWheel, resetColorWheel } = useWorkspace();
+  // Spec section 2.2: "four wheels in a 2×2 grid: Lift (top-left), Gamma (top-right),
+  // Gain (bottom-left), Offset (bottom-right)"
+  const zones = [
+    ["lift",   "Lift"]   as const,
+    ["gamma",  "Gamma"]  as const,
+    ["gain",   "Gain"]   as const,
+    ["offset", "Offset"] as const,
+  ];
   return (
-    <div className="flex items-start justify-between gap-1">
-      {(["lift", "gamma", "gain"] as const).map((zone) => (
+    <div className="grid grid-cols-2 gap-3">
+      {zones.map(([zone, label]) => (
         <ColorWheel
           key={zone}
-          label={zone}
+          label={label}
           value={colorWheels[zone]}
           onChange={(v) => setColorWheel(zone, v)}
           onReset={() => resetColorWheel(zone)}

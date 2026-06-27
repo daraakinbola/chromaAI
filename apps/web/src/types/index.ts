@@ -68,15 +68,17 @@ export interface WheelState {
 }
 
 export interface ColorWheelState {
-  lift:  WheelState;  // shadows zone
-  gamma: WheelState;  // midtones zone
-  gain:  WheelState;  // highlights zone
+  lift:   WheelState;  // shadows zone
+  gamma:  WheelState;  // midtones zone
+  gain:   WheelState;  // highlights zone
+  offset: WheelState;  // global (all zones equally) — spec section 2.1
 }
 
 export const defaultColorWheelState: ColorWheelState = {
-  lift:  { hue: 0, saturation: 0, luminance: 0 },
-  gamma: { hue: 0, saturation: 0, luminance: 0 },
-  gain:  { hue: 0, saturation: 0, luminance: 0 },
+  lift:   { hue: 0, saturation: 0, luminance: 0 },
+  gamma:  { hue: 0, saturation: 0, luminance: 0 },
+  gain:   { hue: 0, saturation: 0, luminance: 0 },
+  offset: { hue: 0, saturation: 0, luminance: 0 },
 };
 
 // ─── HSL (not in spec AdjustmentState — kept as separate workspace state) ───

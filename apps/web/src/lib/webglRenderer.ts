@@ -67,15 +67,12 @@ const FS = /* glsl */ `
   // Each vec3 = (hue_shift, sat_delta, lum_delta) all normalised to −1..+1
   uniform vec3 u_hsl[8];
 
-  // Lift / Gamma / Gain — zone-weighted colour offsets (pre-computed in JS)
-  // u_*_color: RGB delta centred at 0 (computed from wheel hue+saturation)
-  // u_*_lum:   scalar luminance delta
-  uniform vec3  u_lift_color;
-  uniform vec3  u_gamma_color;
-  uniform vec3  u_gain_color;
-  uniform float u_lift_lum;
-  uniform float u_gamma_lum;
-  uniform float u_gain_lum;
+  // Lift / Gamma / Gain / Offset wheels — raw hue/sat/lum per zone
+  // x = hue (0–360°), y = saturation (0–1), z = luminance (−1…+1)
+  uniform vec3 u_lift_wheel;
+  uniform vec3 u_gamma_wheel;
+  uniform vec3 u_gain_wheel;
+  uniform vec3 u_offset_wheel;
 
   // ── RGB ↔ HSL ─────────────────────────────────────────────────────────────
   vec3 rgb2hsl(vec3 c) {
@@ -114,6 +111,18 @@ const FS = /* glsl */ `
   float adjustSat(float s, float f) {
     return f > 0.0 ? clamp(s + f * (1.0 - s), 0.0, 1.0)
                    : clamp(s + f * s,           0.0, 1.0);
+  }
+
+  // ── Wheel hue/sat/lum → RGB offset (spec section 2.3) ───────────────────
+  // Converts a colour-wheel position (hueDeg 0-360, sat 0-1, lum -1..+1)
+  // into an additive RGB delta vector.
+  //   sat=0, lum=0 → (0,0,0)  no change
+  //   sat=1, lum=0 → colour direction push, max ±0.25/channel (scaled ×0.5)
+  //   sat=0, lum=1 → (+0.3,+0.3,+0.3)  pure luminance lift
+  vec3 hslToRgbOffset(float hueDeg, float sat, float lum) {
+    vec3 baseColor = hsl2rgb(vec3(hueDeg / 360.0, sat, 0.5));
+    vec3 colorOffset = (baseColor - vec3(0.5)) * 0.5;  // max ±0.25 per channel
+    return colorOffset + vec3(lum * 0.3);
   }
 
   void main() {
@@ -255,20 +264,25 @@ const FS = /* glsl */ `
       }
     }
 
-    // ── 13. Lift / Gamma / Gain (zone-weighted additive blending) ─────────
-    // Quadratic zone weights of Rec.709 luminance L:
-    //   lift  (1−L)²   peaks at L=0 (shadows)
-    //   gamma 4L(1−L)  peaks at L=0.5 (midtones, max weight = 1)
-    //   gain  L²       peaks at L=1 (highlights)
-    // JS pre-scales u_*_color by 0.5 (max ±0.25 per channel at full sat)
-    // and u_*_lum by 0.3 for comfortable range.
+    // ── 13. Lift / Gamma / Gain / Offset (spec section 2.3) ─────────────────
+    // Zone weights via smoothstep (spec-exact formula):
+    //   shadowWeight    = 1 − smoothstep(0.0, 0.5, L)  peaks at L=0
+    //   highlightWeight = smoothstep(0.5, 1.0, L)       peaks at L=1
+    //   midtoneWeight   = 1 − shadow − highlight         peaks at L=0.5
+    // Offset wheel applies equally to all zones.
     {
-      float lggL = dot(rgb, vec3(0.2126, 0.7152, 0.0722));
-      float wL = (1.0 - lggL) * (1.0 - lggL);
-      float wM = 4.0 * lggL * (1.0 - lggL);
-      float wH = lggL * lggL;
-      rgb += u_lift_color  * wL + u_gamma_color * wM + u_gain_color * wH;
-      rgb += vec3(u_lift_lum * wL + u_gamma_lum * wM + u_gain_lum * wH);
+      float L = dot(rgb, vec3(0.2126, 0.7152, 0.0722));
+      float shadowWeight    = 1.0 - smoothstep(0.0, 0.5, L);
+      float highlightWeight = smoothstep(0.5, 1.0, L);
+      float midtoneWeight   = 1.0 - shadowWeight - highlightWeight;
+      vec3 liftRGB   = hslToRgbOffset(u_lift_wheel.x,   u_lift_wheel.y,   u_lift_wheel.z);
+      vec3 gammaRGB  = hslToRgbOffset(u_gamma_wheel.x,  u_gamma_wheel.y,  u_gamma_wheel.z);
+      vec3 gainRGB   = hslToRgbOffset(u_gain_wheel.x,   u_gain_wheel.y,   u_gain_wheel.z);
+      vec3 offsetRGB = hslToRgbOffset(u_offset_wheel.x, u_offset_wheel.y, u_offset_wheel.z);
+      rgb += liftRGB  * shadowWeight
+           + gammaRGB * midtoneWeight
+           + gainRGB  * highlightWeight
+           + offsetRGB;
       rgb  = clamp(rgb, 0.0, 1.0);
     }
 
@@ -323,31 +337,9 @@ function flattenHsl(hsl: HslAdjustments): number[] {
 
 // ─── Lift / Gamma / Gain helpers ─────────────────────────────────────────────
 
-function _h2r(p: number, q: number, t: number): number {
-  if (t < 0) t += 1;
-  if (t > 1) t -= 1;
-  if (t < 1 / 6) return p + (q - p) * 6 * t;
-  if (t < 0.5)   return q;
-  if (t < 2 / 3) return p + (q - p) * (2 / 3 - t) * 6;
-  return p;
-}
-
-function hsl01ToRgb(h01: number, s: number, l: number): [number, number, number] {
-  if (s === 0) return [l, l, l];
-  const q = l < 0.5 ? l * (1 + s) : l + s - l * s;
-  const p = 2 * l - q;
-  return [_h2r(p, q, h01 + 1 / 3), _h2r(p, q, h01), _h2r(p, q, h01 - 1 / 3)];
-}
-
-/** Convert a WheelState to the uniform values passed to the shader. */
-function wheelUniforms(w: WheelState): { color: [number, number, number]; lum: number } {
-  const [r, g, b] = hsl01ToRgb(w.hue / 360, w.saturation, 0.5);
-  // Offset from neutral (0.5, 0.5, 0.5).
-  // Scale by 0.5 → max ±0.25 per channel at saturation=1.
-  return {
-    color: [(r - 0.5) * 0.5, (g - 0.5) * 0.5, (b - 0.5) * 0.5],
-    lum: w.luminance * 0.3,
-  };
+/** Flatten a WheelState to the [hue, saturation, luminance] vec3 expected by the shader. */
+function wheelVec3(w: WheelState): [number, number, number] {
+  return [w.hue, w.saturation, w.luminance];
 }
 
 // ─── WebGLRenderer ───────────────────────────────────────────────────────────
@@ -462,10 +454,6 @@ export class WebGLRenderer {
 
     gl.useProgram(this.programInfo.program);
     twgl.setBuffersAndAttributes(gl, this.programInfo, this.bufferInfo);
-    const lift  = wheelUniforms(colorWheels.lift);
-    const gamma = wheelUniforms(colorWheels.gamma);
-    const gain  = wheelUniforms(colorWheels.gain);
-
     twgl.setUniforms(this.programInfo, {
       u_image:        this.texture,
       u_texelSize:    [1 / this.texW, 1 / this.texH],
@@ -483,12 +471,10 @@ export class WebGLRenderer {
       u_temperature:  adj.temperature,
       u_tint:         adj.tint,
       u_hsl:          flattenHsl(hsl),
-      u_lift_color:   lift.color,
-      u_gamma_color:  gamma.color,
-      u_gain_color:   gain.color,
-      u_lift_lum:     lift.lum,
-      u_gamma_lum:    gamma.lum,
-      u_gain_lum:     gain.lum,
+      u_lift_wheel:   wheelVec3(colorWheels.lift),
+      u_gamma_wheel:  wheelVec3(colorWheels.gamma),
+      u_gain_wheel:   wheelVec3(colorWheels.gain),
+      u_offset_wheel: wheelVec3(colorWheels.offset),
     });
     twgl.drawBufferInfo(gl, this.bufferInfo);
   }
