@@ -119,21 +119,12 @@ function useWebGLCanvas(
   const hslRef = useRef(hsl);
   hslRef.current = hsl;
 
-  // Init renderer once
+  // Destroy renderer on unmount only
   useEffect(() => {
-    const canvas = canvasRef.current;
-    if (!canvas || !webglSupported()) return;
-    try {
-      rendererRef.current = new WebGLRenderer(canvas);
-    } catch (e) {
-      console.warn("WebGL renderer failed to init:", e);
-    }
     return () => {
       rendererRef.current?.destroy();
       rendererRef.current = null;
-      setIsReady(false);
     };
-  // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   // Keep canvas backing-store in sync with its CSS display size (spec Section 3.3)
@@ -154,9 +145,26 @@ function useWebGLCanvas(
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [isReady]);
 
-  // Load image texture
+  // Load image texture.
+  // The renderer is lazy-initialised here rather than at mount because the
+  // <canvas> element lives inside the activeImage conditional branch — its ref
+  // is null at mount time (no image yet).  By the time imageSrc becomes
+  // non-null the canvas is already in the DOM, so canvasRef.current is valid.
   useEffect(() => {
-    if (!rendererRef.current || !imageSrc) { setIsReady(false); return; }
+    if (!imageSrc) { setIsReady(false); return; }
+
+    if (!rendererRef.current) {
+      const canvas = canvasRef.current;
+      if (!canvas || !webglSupported()) { setIsReady(false); return; }
+      try {
+        rendererRef.current = new WebGLRenderer(canvas);
+      } catch (e) {
+        console.warn("WebGL renderer failed to init:", e);
+        setIsReady(false);
+        return;
+      }
+    }
+
     setIsReady(false);
     rendererRef.current.loadImage(imageSrc)
       .then(() => setIsReady(true))
