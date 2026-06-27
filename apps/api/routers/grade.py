@@ -2,6 +2,7 @@ import time
 import base64
 from pathlib import Path
 from fastapi import APIRouter, HTTPException
+from pydantic import BaseModel
 from models.schemas import (
     ApplyGradeRequest,
     ApplyGradeResponse,
@@ -13,6 +14,24 @@ from services import ai_engine
 router = APIRouter(prefix="/grade", tags=["grade"])
 
 UPLOAD_DIR = Path("uploads")
+
+
+class AnalyzeDataRequest(BaseModel):
+    data_url: str                       # base64 data URL of the image thumbnail
+    session_genre: SessionGenre | None = None
+
+
+@router.post("/analyze-data", response_model=SceneAnalysis)
+async def analyze_image_data(req: AnalyzeDataRequest) -> SceneAnalysis:
+    """
+    Analyze an image supplied as a base64 data URL (typically the 120×80
+    thumbnail generated client-side).  Used when the image has not been
+    uploaded to the server file store.
+    """
+    _, _, b64 = req.data_url.partition(",")
+    if not b64:
+        raise HTTPException(status_code=422, detail="Invalid data URL — no base64 payload")
+    return await ai_engine.analyze_scene(b64, req.session_genre)
 
 
 @router.post("/apply", response_model=ApplyGradeResponse)

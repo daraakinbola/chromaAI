@@ -1,8 +1,8 @@
 /**
  * WebGL shader pipeline — Section 3.2 Option B of the Phase 2 TechSpec.
  *
- * Single-pass fragment shader implementing all AdjustmentState fields with the
- * exact math prescribed by the spec:
+ * Single-pass fragment shader implementing all AdjustmentState fields plus
+ * per-channel HSL (8 hue bands) with the exact math prescribed by the spec:
  *   Exposure    pow(2, value)
  *   Contrast    S-curve centred at 0.5
  *   Highlights  smoothstep mask on luminous regions
@@ -13,6 +13,7 @@
  *   Tint        green-magenta axis shift
  *   Saturation  RGB → HSL → multiply S → HSL → RGB
  *   Vibrance    like Saturation, scaled by (1 − S) to spare saturated pixels
+ *   HSL         per-hue-band hue/saturation/luminance (8 bands, triangular weights)
  *   Clarity     unsharp mask at medium radius via 5-tap cross blur
  *
  * Contain-fit letterboxing is handled in the shader so the canvas can fill its
@@ -24,7 +25,8 @@
  */
 
 import * as twgl from "twgl.js";
-import type { AdjustmentState } from "@/types";
+import type { AdjustmentState, HslAdjustments } from "@/types";
+import { defaultHslAdjustments } from "@/types";
 
 // ─── Shaders ─────────────────────────────────────────────────────────────────
 
@@ -60,6 +62,10 @@ const FS = /* glsl */ `
   uniform float u_temperature;   // Kelvin  2000 … 50000
   uniform float u_tint;          // −150 … +150
   uniform vec2  u_texelSize;     // 1/texW, 1/texH  (for clarity blur)
+
+  // Per-channel HSL: 8 bands (Red, Orange, Yellow, Green, Aqua, Blue, Purple, Magenta)
+  // Each vec3 = (hue_shift, sat_delta, lum_delta) all normalised to −1..+1
+  uniform vec3 u_hsl[8];
 
   // ── RGB ↔ HSL ─────────────────────────────────────────────────────────────
   vec3 rgb2hsl(vec3 c) {
@@ -194,7 +200,52 @@ const FS = /* glsl */ `
       rgb = hsl2rgb(hsl);
     }
 
-    // ── 12. Clarity (spec: unsharp mask at medium radius) ─────────────────
+    // ── 12. Per-channel HSL (8 hue bands) ─────────────────────────────────
+    // Band centres (0-1 hue): Red=0, Orange=1/12, Yellow=1/6, Green=1/3,
+    //   Aqua=1/2, Blue=2/3, Purple=3/4, Magenta=11/12.
+    // Triangular falloff with half-width HW ≈ 30° so adjacent bands overlap.
+    // u_hsl[i].xyz = (hue_shift, sat_delta, lum_delta) each −1..+1.
+    //   hue: ±1 → ±180° (±0.5 in 0-1 space).
+    //   sat/lum: proportional push toward 1 (positive) or 0 (negative).
+    {
+      vec3 px = rgb2hsl(rgb);
+      if (px.y > 0.02) {    // skip nearly-grey pixels — hue is undefined there
+        float h  = px.x;
+        float HW = 0.0833;  // ~30° half-width
+        // Circular hue distances
+        float d0 = min(abs(h-0.0000), 1.0-abs(h-0.0000));
+        float d1 = min(abs(h-0.0833), 1.0-abs(h-0.0833));
+        float d2 = min(abs(h-0.1667), 1.0-abs(h-0.1667));
+        float d3 = min(abs(h-0.3333), 1.0-abs(h-0.3333));
+        float d4 = min(abs(h-0.5000), 1.0-abs(h-0.5000));
+        float d5 = min(abs(h-0.6667), 1.0-abs(h-0.6667));
+        float d6 = min(abs(h-0.7500), 1.0-abs(h-0.7500));
+        float d7 = min(abs(h-0.9167), 1.0-abs(h-0.9167));
+        // Triangular band weights
+        float w0 = max(0.0, 1.0-d0/HW);
+        float w1 = max(0.0, 1.0-d1/HW);
+        float w2 = max(0.0, 1.0-d2/HW);
+        float w3 = max(0.0, 1.0-d3/HW);
+        float w4 = max(0.0, 1.0-d4/HW);
+        float w5 = max(0.0, 1.0-d5/HW);
+        float w6 = max(0.0, 1.0-d6/HW);
+        float w7 = max(0.0, 1.0-d7/HW);
+        // Weighted sum of per-band deltas
+        float dH = w0*u_hsl[0].x+w1*u_hsl[1].x+w2*u_hsl[2].x+w3*u_hsl[3].x
+                  +w4*u_hsl[4].x+w5*u_hsl[5].x+w6*u_hsl[6].x+w7*u_hsl[7].x;
+        float dS = w0*u_hsl[0].y+w1*u_hsl[1].y+w2*u_hsl[2].y+w3*u_hsl[3].y
+                  +w4*u_hsl[4].y+w5*u_hsl[5].y+w6*u_hsl[6].y+w7*u_hsl[7].y;
+        float dL = w0*u_hsl[0].z+w1*u_hsl[1].z+w2*u_hsl[2].z+w3*u_hsl[3].z
+                  +w4*u_hsl[4].z+w5*u_hsl[5].z+w6*u_hsl[6].z+w7*u_hsl[7].z;
+        // Apply: hue ±180°; sat/lum proportional push toward 0 or 1
+        px.x = fract(px.x + dH * 0.5);
+        px.y = clamp(dS >= 0.0 ? px.y+dS*(1.0-px.y) : px.y+dS*px.y, 0.0, 1.0);
+        px.z = clamp(dL >= 0.0 ? px.z+dL*(1.0-px.z) : px.z+dL*px.z, 0.0, 1.0);
+        rgb = hsl2rgb(px);
+      }
+    }
+
+    // ── 13. Clarity (spec: unsharp mask at medium radius) ─────────────────
     if (abs(u_clarity) > 0.01) {
       // 5-tap cross blur at medium radius (~20 image-space pixels)
       float R = 20.0;
@@ -231,6 +282,18 @@ const DEFAULT_ADJ: AdjustmentState = {
   temperature: 5500, tint: 0,
 };
 
+const HSL_CHANNEL_ORDER: (keyof HslAdjustments)[] = [
+  "red", "orange", "yellow", "green", "aqua", "blue", "purple", "magenta",
+];
+
+function flattenHsl(hsl: HslAdjustments): number[] {
+  return HSL_CHANNEL_ORDER.flatMap((k) => [
+    hsl[k].hue        / 100,
+    hsl[k].saturation / 100,
+    hsl[k].luminance  / 100,
+  ]);
+}
+
 // ─── WebGLRenderer ───────────────────────────────────────────────────────────
 
 export class WebGLRenderer {
@@ -243,8 +306,9 @@ export class WebGLRenderer {
   private texW = 1;
   private texH = 1;
 
-  /** Latest-pending adjustment state for RAF batching. */
+  /** Latest-pending state for RAF batching. */
   private pendingAdj: AdjustmentState | null = null;
+  private pendingHsl: HslAdjustments = defaultHslAdjustments;
   private rafId: number | null = null;
 
   constructor(canvas: HTMLCanvasElement) {
@@ -295,28 +359,35 @@ export class WebGLRenderer {
 
   /**
    * Schedule a render for the next animation frame (spec: ≤ 8 ms debounce).
-   * Rapid calls within the same frame are batched — only the latest adj is used.
+   * Rapid calls within the same frame are batched — only the latest state is used.
    */
-  render(adj: AdjustmentState = DEFAULT_ADJ): void {
+  render(
+    adj: AdjustmentState = DEFAULT_ADJ,
+    hsl: HslAdjustments = defaultHslAdjustments
+  ): void {
     this.pendingAdj = adj;
+    this.pendingHsl = hsl;
     if (this.rafId !== null) return; // already queued
     this.rafId = requestAnimationFrame(() => {
       this.rafId = null;
-      if (this.pendingAdj) this._draw(this.pendingAdj);
+      if (this.pendingAdj) this._draw(this.pendingAdj, this.pendingHsl);
       this.pendingAdj = null;
     });
   }
 
   /** Synchronous draw — use only when you need the result immediately (e.g., export). */
-  drawSync(adj: AdjustmentState = DEFAULT_ADJ): void {
+  drawSync(
+    adj: AdjustmentState = DEFAULT_ADJ,
+    hsl: HslAdjustments = defaultHslAdjustments
+  ): void {
     if (this.rafId !== null) {
       cancelAnimationFrame(this.rafId);
       this.rafId = null;
     }
-    this._draw(adj);
+    this._draw(adj, hsl);
   }
 
-  private _draw(adj: AdjustmentState): void {
+  private _draw(adj: AdjustmentState, hsl: HslAdjustments): void {
     const gl = this.gl;
     if (!this.texture) return;
 
@@ -347,6 +418,7 @@ export class WebGLRenderer {
       u_saturation:   adj.saturation,
       u_temperature:  adj.temperature,
       u_tint:         adj.tint,
+      u_hsl:          flattenHsl(hsl),
     });
     twgl.drawBufferInfo(gl, this.bufferInfo);
   }

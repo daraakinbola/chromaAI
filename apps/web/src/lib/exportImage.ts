@@ -1,6 +1,7 @@
 import JSZip from "jszip";
 import { WebGLRenderer, webglSupported } from "@/lib/webglRenderer";
-import type { AdjustmentState, ImageRecord } from "@/types";
+import type { AdjustmentState, HslAdjustments, ImageRecord } from "@/types";
+import { defaultHslAdjustments } from "@/types";
 
 export type ExportFormat = "image/jpeg" | "image/png" | "image/webp";
 export type ExportResolution = "full" | "2k" | "1080p";
@@ -55,7 +56,8 @@ function triggerDownload(blob: Blob, filename: string): void {
 async function renderToBlob(
   image: ImageRecord,
   options: ExportOptions,
-  adjustments: AdjustmentState
+  adjustments: AdjustmentState,
+  hsl: HslAdjustments = defaultHslAdjustments
 ): Promise<Blob> {
   const { format, quality, resolution } = options;
   const { width, height } = resolveResolution(image.width, image.height, resolution);
@@ -67,7 +69,7 @@ async function renderToBlob(
     const renderer = new WebGLRenderer(canvas);
     try {
       await renderer.loadImage(image.originalDataUrl);
-      renderer.drawSync(adjustments);
+      renderer.drawSync(adjustments, hsl);
       return await new Promise<Blob>((resolve, reject) => {
         canvas.toBlob(
           (b) => (b ? resolve(b) : reject(new Error("toBlob returned null"))),
@@ -114,9 +116,10 @@ async function renderToBlob(
 export async function exportImage(
   image: ImageRecord,
   options: ExportOptions,
-  adjustments: AdjustmentState
+  adjustments: AdjustmentState,
+  hsl: HslAdjustments = defaultHslAdjustments
 ): Promise<void> {
-  const blob = await renderToBlob(image, options, adjustments);
+  const blob = await renderToBlob(image, options, adjustments, hsl);
   triggerDownload(blob, outputFilename(image, options.format));
 }
 
@@ -130,14 +133,15 @@ export async function exportImage(
 export async function batchExportImages(
   images: ImageRecord[],
   options: ExportOptions,
-  onProgress: (done: number, total: number) => void
+  onProgress: (done: number, total: number) => void,
+  hsl: HslAdjustments = defaultHslAdjustments
 ): Promise<void> {
   const zip = new JSZip();
   const total = images.length;
 
   for (let i = 0; i < images.length; i++) {
     const image = images[i];
-    const blob = await renderToBlob(image, options, image.adjustments);
+    const blob = await renderToBlob(image, options, image.adjustments, hsl);
     zip.file(outputFilename(image, options.format), blob);
     onProgress(i + 1, total);
   }

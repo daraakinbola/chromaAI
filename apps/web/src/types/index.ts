@@ -14,6 +14,16 @@ export interface AdjustmentState {
   tint: number;         // -150 to +150, default 0
 }
 
+// Mirrors SceneAnalysis in apps/api/models/schemas.py
+export interface SceneAnalysis {
+  subject: string;
+  lighting_condition: string;
+  has_skin_tones: boolean;
+  mood_baseline: string;
+  color_temperature_estimate: number;
+  confidence: number;
+}
+
 export interface ImageRecord {
   id: string;              // uuid generated on import
   filename: string;        // original filename
@@ -26,6 +36,8 @@ export interface ImageRecord {
   adjustments: AdjustmentState; // current adjustment values
   consistencyScore: number; // 0-100, defaults to 100 on import
   flagged: boolean;        // manually flagged by user
+  /** undefined = not yet triggered; null = in-flight; SceneAnalysis = complete */
+  sceneAnalysis?: SceneAnalysis | null;
 }
 
 // Backward-compat alias — existing code can keep using Adjustments

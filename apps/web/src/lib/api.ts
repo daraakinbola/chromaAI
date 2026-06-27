@@ -3,6 +3,8 @@ import type {
   BatchAdaptResponse,
   PromptSubmitRequest,
   PromptSubmitResponse,
+  SceneAnalysis,
+  SessionGenre,
 } from "@/types";
 
 const BASE = "/api";
@@ -40,6 +42,11 @@ export const api = {
   grade: {
     analyze: (imageId: string) =>
       request<{ scene: unknown; skinTones: boolean }>(`/grade/analyze/${imageId}`),
+    analyzeData: (dataUrl: string, genre?: SessionGenre | null) =>
+      request<SceneAnalysis>("/grade/analyze-data", {
+        method: "POST",
+        body: JSON.stringify({ data_url: dataUrl, session_genre: genre ?? null }),
+      }),
     apply: (imageId: string, adjustments: unknown) =>
       request<{ preview_url: string; render_time_ms: number }>(`/grade/apply`, {
         method: "POST",

@@ -12,7 +12,7 @@ import { clsx } from "clsx";
 import { useWorkspace } from "@/context/WorkspaceContext";
 import { ACCEPTED_EXTENSIONS } from "@/lib/imageImport";
 import { WebGLRenderer, webglSupported } from "@/lib/webglRenderer";
-import type { AdjustmentState, ViewMode } from "@/types";
+import type { AdjustmentState, HslAdjustments, ViewMode } from "@/types";
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
@@ -109,12 +109,15 @@ function ViewLabel({ text, position }: { text: string; position: "left" | "right
 function useWebGLCanvas(
   canvasRef: React.RefObject<HTMLCanvasElement | null>,
   imageSrc: string | null,
-  adjustments: AdjustmentState
+  adjustments: AdjustmentState,
+  hsl: HslAdjustments
 ): { isReady: boolean } {
   const rendererRef = useRef<WebGLRenderer | null>(null);
   const [isReady, setIsReady] = useState(false);
   const adjRef = useRef(adjustments);
   adjRef.current = adjustments;
+  const hslRef = useRef(hsl);
+  hslRef.current = hsl;
 
   // Init renderer once
   useEffect(() => {
@@ -134,6 +137,7 @@ function useWebGLCanvas(
   }, []);
 
   // Keep canvas backing-store in sync with its CSS display size (spec Section 3.3)
+  // CSS transforms don't affect offsetWidth/Height, so this stays at container resolution.
   useEffect(() => {
     const canvas = canvasRef.current;
     if (!canvas) return;
@@ -142,7 +146,7 @@ function useWebGLCanvas(
       if (w && h && (canvas.width !== w || canvas.height !== h)) {
         canvas.width = w;
         canvas.height = h;
-        if (isReady) rendererRef.current?.render(adjRef.current);
+        if (isReady) rendererRef.current?.render(adjRef.current, hslRef.current);
       }
     });
     obs.observe(canvas);
@@ -159,12 +163,12 @@ function useWebGLCanvas(
       .catch(console.error);
   }, [imageSrc]);
 
-  // Re-render on adjustment change (RAF-batched inside renderer)
+  // Re-render when adjustments or HSL change (RAF-batched inside renderer)
   useEffect(() => {
     if (!isReady) return;
-    rendererRef.current?.render(adjustments);
+    rendererRef.current?.render(adjustments, hsl);
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [adjustments, isReady]);
+  }, [adjustments, hsl, isReady]);
 
   return { isReady };
 }
@@ -172,7 +176,7 @@ function useWebGLCanvas(
 // ─── Canvas component ─────────────────────────────────────────────────────────
 
 export function Canvas() {
-  const { images, activeImageId, viewMode, setViewMode, adjustments, effectiveAdjustments, importImages } =
+  const { images, activeImageId, viewMode, setViewMode, adjustments, effectiveAdjustments, hsl, importImages } =
     useWorkspace();
   const fileInputRef = useRef<HTMLInputElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
@@ -183,16 +187,29 @@ export function Canvas() {
   const [isDragging, setIsDragging]           = useState(false);
   const [containerSize, setContainerSize]     = useState({ w: 0, h: 0 });
 
+  // ── Zoom / pan state ───────────────────────────────────────────────────────
+  const [zoom, setZoom]       = useState(1.0);
+  const [pan, setPan]         = useState({ x: 0, y: 0 });
+  const [isPanning, setIsPanning] = useState(false);
+
+  // Refs for use inside event handlers without stale closures
+  const zoomRef      = useRef(zoom);
+  zoomRef.current    = zoom;
+  const panRef       = useRef(pan);
+  panRef.current     = pan;
+  const panOriginRef = useRef({ startX: 0, startY: 0, panX: 0, panY: 0 });
+
   const activeImage = images.find((i) => i.id === activeImageId) ?? null;
 
-  // WebGL renderer — renders effectiveAdjustments (base + reference contributions)
+  // WebGL renderer — renders effectiveAdjustments + HSL
   const { isReady } = useWebGLCanvas(
     glCanvasRef,
     activeImage?.originalDataUrl ?? null,
-    effectiveAdjustments
+    effectiveAdjustments,
+    hsl
   );
 
-  // Track container dimensions for containFit calculation
+  // Track container dimensions for containFit calculation and split clip math
   useLayoutEffect(() => {
     const el = containerRef.current;
     if (!el) return;
@@ -204,19 +221,87 @@ export function Canvas() {
     return () => obs.disconnect();
   }, []);
 
-  // Backslash — before/after toggle (spec Section 3.4)
+  // ── Zoom helpers ───────────────────────────────────────────────────────────
+
+  const zoomIn   = useCallback(() => setZoom(z => Math.min(20, z * 1.25)), []);
+  const zoomOut  = useCallback(() => setZoom(z => Math.max(0.1, z / 1.25)), []);
+  const resetZoom = useCallback(() => { setZoom(1); setPan({ x: 0, y: 0 }); }, []);
+
+  // ── Keyboard shortcuts ─────────────────────────────────────────────────────
+
   useEffect(() => {
     const handler = (e: KeyboardEvent) => {
-      if (e.key === "\\" && !e.ctrlKey && !e.metaKey && !e.altKey)
-        setIsShowingBefore((s) => !s);
+      // Don't fire when user is typing in an input
+      if (e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement) return;
+      if (e.ctrlKey || e.metaKey || e.altKey) return;
+      if (e.key === "\\") setIsShowingBefore(s => !s);
+      if (e.key === "+" || e.key === "=") { e.preventDefault(); zoomIn(); }
+      if (e.key === "-") { e.preventDefault(); zoomOut(); }
+      if (e.key === "0") { e.preventDefault(); resetZoom(); }
     };
     window.addEventListener("keydown", handler);
     return () => window.removeEventListener("keydown", handler);
+  }, [zoomIn, zoomOut, resetZoom]);
+
+  // ── Scroll-wheel zoom toward cursor ───────────────────────────────────────
+  // Must be non-passive to call preventDefault and suppress browser page scroll.
+
+  useEffect(() => {
+    const el = containerRef.current;
+    if (!el) return;
+    const handler = (e: WheelEvent) => {
+      e.preventDefault();
+      const rect = el.getBoundingClientRect();
+      // Cursor position relative to container center
+      const mx = e.clientX - rect.left - rect.width  / 2;
+      const my = e.clientY - rect.top  - rect.height / 2;
+      const factor  = e.deltaY < 0 ? 1.15 : 1 / 1.15;
+      const newZoom = Math.max(0.1, Math.min(20, zoomRef.current * factor));
+      const k = newZoom / zoomRef.current;
+      // Update ref immediately so rapid successive events compound correctly
+      zoomRef.current = newZoom;
+      // Zoom toward cursor: keep the world point under the cursor stationary
+      setPan(p => ({ x: mx - (mx - p.x) * k, y: my - (my - p.y) * k }));
+      setZoom(newZoom);
+    };
+    el.addEventListener("wheel", handler, { passive: false });
+    return () => el.removeEventListener("wheel", handler);
   }, []);
 
-  // Split divider drag
+  // ── Drag to pan ────────────────────────────────────────────────────────────
+
+  const startPan = useCallback((e: React.MouseEvent) => {
+    if (e.button !== 0) return;
+    e.preventDefault();
+    panOriginRef.current = {
+      startX: e.clientX,
+      startY: e.clientY,
+      panX: panRef.current.x,
+      panY: panRef.current.y,
+    };
+    setIsPanning(true);
+  }, []);
+
+  useEffect(() => {
+    if (!isPanning) return;
+    const onMove = (e: MouseEvent) => {
+      const { startX, startY, panX, panY } = panOriginRef.current;
+      setPan({ x: panX + (e.clientX - startX), y: panY + (e.clientY - startY) });
+    };
+    const onUp = () => setIsPanning(false);
+    window.addEventListener("mousemove", onMove);
+    window.addEventListener("mouseup", onUp);
+    return () => {
+      window.removeEventListener("mousemove", onMove);
+      window.removeEventListener("mouseup", onUp);
+    };
+  }, [isPanning]);
+
+  // ── Split divider drag ─────────────────────────────────────────────────────
+
   const startDrag = useCallback((e: React.MouseEvent) => {
     e.preventDefault();
+    e.stopPropagation(); // Prevent triggering startPan on the transform wrapper
     setIsDragging(true);
   }, []);
 
@@ -231,7 +316,10 @@ export function Canvas() {
     const onUp = () => setIsDragging(false);
     window.addEventListener("mousemove", onMove);
     window.addEventListener("mouseup", onUp);
-    return () => { window.removeEventListener("mousemove", onMove); window.removeEventListener("mouseup", onUp); };
+    return () => {
+      window.removeEventListener("mousemove", onMove);
+      window.removeEventListener("mouseup", onUp);
+    };
   }, [isDragging]);
 
   const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -241,23 +329,32 @@ export function Canvas() {
 
   // ── Derived geometry ───────────────────────────────────────────────────────
 
-  /**
-   * The WebGL canvas fills the container 100 % × 100 % and handles its own
-   * contain-fit letterboxing in the shader.  We use the same containFit()
-   * math to position the "before" <img> at the identical position so that
-   * split-view clip paths line up perfectly.
-   */
   const fit = activeImage
     ? containFit(containerSize.w, containerSize.h, activeImage.width, activeImage.height)
     : null;
 
   /**
-   * For split-view, the clip origin is the container (not fit).
-   * Convert container-space splitPos → fit-space percentage for clip-path.
+   * Split-view clip positions in element-local space (pre-transform).
+   *
+   * The transform wrapper is `translate(panX, panY) scale(zoom)` from center.
+   * The screen-space divider at `splitPos * containerW` maps to wrapper-local X:
+   *   X_local = containerW/2 + (splitPos*containerW - containerW/2 - panX) / zoom
+   *
+   * We then express that as clip-path percentages for each element.
    */
-  const splitPctInFit = fit
-    ? Math.max(0, Math.min(100, ((splitPos * containerSize.w - fit.left) / fit.width) * 100))
+  const splitXLocal = containerSize.w > 0
+    ? containerSize.w / 2 + (splitPos * containerSize.w - containerSize.w / 2 - pan.x) / zoom
+    : splitPos * containerSize.w;
+
+  // GL canvas (fills wrapper = container dims): clip from left at this %
+  const canvasSplitPct = containerSize.w > 0
+    ? Math.max(0, Math.min(100, (splitXLocal / containerSize.w) * 100))
     : splitPos * 100;
+
+  // Before-img (positioned at fit.left, fit.width): clip from right so right side is hidden
+  const imgSplitFromRight = (fit && containerSize.w > 0)
+    ? Math.max(0, Math.min(100, 100 - ((splitXLocal - fit.left) / fit.width) * 100))
+    : 100 - splitPos * 100;
 
   return (
     <main className="flex flex-col flex-1 min-w-0 bg-zinc-950">
@@ -292,11 +389,25 @@ export function Canvas() {
               &nbsp;·&nbsp;{Math.round(effectiveAdjustments.temperature)}K
             </span>
             <div className="flex items-center gap-1 ml-2">
-              <button className="p-1 rounded text-zinc-600 hover:text-zinc-300 hover:bg-zinc-800 transition-colors">
+              <button
+                onClick={zoomOut}
+                title="Zoom out (−)"
+                className="p-1 rounded text-zinc-600 hover:text-zinc-300 hover:bg-zinc-800 transition-colors"
+              >
                 <ZoomOut className="w-3.5 h-3.5" />
               </button>
-              <span className="font-mono text-zinc-500 w-10 text-center">100%</span>
-              <button className="p-1 rounded text-zinc-600 hover:text-zinc-300 hover:bg-zinc-800 transition-colors">
+              <button
+                onClick={resetZoom}
+                title="Reset zoom (0)"
+                className="font-mono text-zinc-500 hover:text-zinc-300 w-12 text-center text-xs transition-colors rounded px-1 py-0.5 hover:bg-zinc-800"
+              >
+                {Math.round(zoom * 100)}%
+              </button>
+              <button
+                onClick={zoomIn}
+                title="Zoom in (+)"
+                className="p-1 rounded text-zinc-600 hover:text-zinc-300 hover:bg-zinc-800 transition-colors"
+              >
                 <ZoomIn className="w-3.5 h-3.5" />
               </button>
             </div>
@@ -311,62 +422,85 @@ export function Canvas() {
         ) : (
           <>
             {/*
-             * WebGL canvas — always mounted so the GL context survives view-mode
-             * switches. Fills the container; the shader handles contain-fit
-             * letterboxing internally.
+             * Transform wrapper — applies zoom/pan via CSS transform.
+             * All image content lives inside so they move together.
+             * The split divider is a sibling (outside) so it stays in screen space.
              *
-             * Visibility rules:
-             *   single     → visible, no clip
-             *   before-after, after → visible, no clip
-             *   before-after, before → hidden (original <img> shown instead)
-             *   split      → visible, clipped to right half
+             * CSS transforms do not affect offsetWidth/Height, so the WebGL
+             * canvas backing-store remains at container resolution regardless
+             * of zoom level (visual scaling is handled by the browser).
              */}
-            <canvas
-              ref={glCanvasRef}
-              className={clsx(
-                "absolute inset-0 w-full h-full",
-                !isReady && "opacity-0"
-              )}
+            <div
               style={{
-                visibility:
-                  viewMode === "before-after" && isShowingBefore ? "hidden" : "visible",
-                clipPath:
-                  viewMode === "split"
-                    ? `inset(0 0 0 ${splitPctInFit}%)`
-                    : undefined,
+                position: "absolute",
+                inset: 0,
+                transform: `translate(${pan.x}px, ${pan.y}px) scale(${zoom})`,
+                transformOrigin: "50% 50%",
+                cursor: isPanning ? "grabbing" : "grab",
               }}
-            />
-
-            {/*
-             * Original "before" image — shown when:
-             *   before-after AND isShowingBefore  → full view, no clip
-             *   split                              → left half, clipped
-             */}
-            {(viewMode === "before-after" || viewMode === "split") && fit && (
-              // eslint-disable-next-line @next/next/no-img-element
-              <img
-                src={activeImage.originalDataUrl}
-                alt={activeImage.filename}
-                draggable={false}
+              onMouseDown={startPan}
+            >
+              {/*
+               * WebGL canvas — always mounted so the GL context survives view-mode
+               * switches. Fills the transform wrapper; shader handles contain-fit
+               * letterboxing internally.
+               *
+               * Visibility / clip rules:
+               *   single        → visible, no clip
+               *   before-after (after) → visible, no clip
+               *   before-after (before) → hidden (original <img> shown instead)
+               *   split         → visible, clipped to right of canvasSplitPct
+               */}
+              <canvas
+                ref={glCanvasRef}
+                className={clsx(
+                  "absolute inset-0 w-full h-full",
+                  !isReady && "opacity-0"
+                )}
                 style={{
-                  position: "absolute",
-                  left:   fit.left,
-                  top:    fit.top,
-                  width:  fit.width,
-                  height: fit.height,
                   visibility:
-                    viewMode === "before-after" && !isShowingBefore ? "hidden" : "visible",
+                    viewMode === "before-after" && isShowingBefore ? "hidden" : "visible",
                   clipPath:
                     viewMode === "split"
-                      ? `inset(0 ${100 - splitPctInFit}% 0 0)`
+                      ? `inset(0 0 0 ${canvasSplitPct}%)`
                       : undefined,
-                  userSelect: "none",
-                  pointerEvents: "none",
                 }}
               />
-            )}
 
-            {/* Split divider */}
+              {/*
+               * Original "before" image — shown when:
+               *   before-after AND isShowingBefore → full view, no clip
+               *   split                            → left half, clipped at imgSplitFromRight
+               *
+               * Positioned using containFit to overlay the exact letterbox rect
+               * that the WebGL shader is rendering into.
+               */}
+              {(viewMode === "before-after" || viewMode === "split") && fit && (
+                // eslint-disable-next-line @next/next/no-img-element
+                <img
+                  src={activeImage.originalDataUrl}
+                  alt={activeImage.filename}
+                  draggable={false}
+                  style={{
+                    position: "absolute",
+                    left:   fit.left,
+                    top:    fit.top,
+                    width:  fit.width,
+                    height: fit.height,
+                    visibility:
+                      viewMode === "before-after" && !isShowingBefore ? "hidden" : "visible",
+                    clipPath:
+                      viewMode === "split"
+                        ? `inset(0 ${imgSplitFromRight}% 0 0)`
+                        : undefined,
+                    userSelect: "none",
+                    pointerEvents: "none",
+                  }}
+                />
+              )}
+            </div>
+
+            {/* Split divider — outside the transform wrapper so it stays at screen-space splitPos */}
             {viewMode === "split" && (
               <div
                 className="absolute top-0 bottom-0 z-20 flex flex-col items-center"
@@ -396,13 +530,30 @@ export function Canvas() {
               />
             )}
 
-            {/* Semantic analysis badge */}
-            <div className="absolute bottom-3 right-3 flex items-center gap-2 text-[10px] bg-zinc-900/90 border border-zinc-800 rounded px-2.5 py-1.5 pointer-events-none z-10">
-              <div className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse" />
-              <span className="text-zinc-400">Skin tones protected</span>
-              <span className="text-zinc-600">·</span>
-              <span className="text-zinc-400">Semantic analysis active</span>
-            </div>
+            {/* Semantic analysis badge — driven by real sceneAnalysis data */}
+            {activeImage.sceneAnalysis ? (
+              <div className="absolute bottom-3 right-3 flex items-center gap-2 text-[10px] bg-zinc-900/90 border border-zinc-800 rounded px-2.5 py-1.5 pointer-events-none z-10">
+                <div className="w-1.5 h-1.5 rounded-full bg-emerald-400" />
+                <span className="text-zinc-400">
+                  {activeImage.sceneAnalysis.subject}
+                </span>
+                {activeImage.sceneAnalysis.has_skin_tones && (
+                  <>
+                    <span className="text-zinc-600">·</span>
+                    <span className="text-zinc-400">Skin tones protected</span>
+                  </>
+                )}
+                <span className="text-zinc-600">·</span>
+                <span className="text-zinc-600">
+                  {Math.round(activeImage.sceneAnalysis.confidence * 100)}% confidence
+                </span>
+              </div>
+            ) : activeImage.sceneAnalysis === null ? (
+              <div className="absolute bottom-3 right-3 flex items-center gap-2 text-[10px] bg-zinc-900/90 border border-zinc-800 rounded px-2.5 py-1.5 pointer-events-none z-10">
+                <div className="w-1.5 h-1.5 rounded-full bg-zinc-600 animate-pulse" />
+                <span className="text-zinc-600">Analyzing scene…</span>
+              </div>
+            ) : null}
           </>
         )}
       </div>

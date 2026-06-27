@@ -14,6 +14,7 @@ import {
   ImageRecord,
   PromptEntry,
   ReferenceImage,
+  SceneAnalysis,
   SessionGenre,
   SessionRecord,
   ToastItem,
@@ -202,6 +203,37 @@ export function WorkspaceProvider({ children, sessionId }: WorkspaceProviderProp
   // adjustmentHash drives recalculation; sessionRestored gates it
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [adjustmentHash, sessionRestored]);
+
+  // ── Scene analysis — trigger on image select (Gap 2) ─────────────────────
+  // Fires when activeImageId changes (and session has been restored).
+  // undefined = not yet triggered, null = in-flight, SceneAnalysis = done.
+  // Silently ignored when the API is unavailable.
+
+  useEffect(() => {
+    if (!activeImageId || !sessionRestored) return;
+    const img = images.find((i) => i.id === activeImageId);
+    // Skip if analysis already triggered (null) or complete (object)
+    if (!img || img.sceneAnalysis !== undefined) return;
+
+    // Mark as in-flight
+    setImages((prev) =>
+      prev.map((i) => (i.id === activeImageId ? { ...i, sceneAnalysis: null } : i))
+    );
+
+    api.grade.analyzeData(img.thumbnailDataUrl, sessionGenre)
+      .then((analysis: SceneAnalysis) => {
+        setImages((prev) =>
+          prev.map((i) => (i.id === activeImageId ? { ...i, sceneAnalysis: analysis } : i))
+        );
+      })
+      .catch(() => {
+        // Reset to undefined so next selection can retry
+        setImages((prev) =>
+          prev.map((i) => (i.id === activeImageId ? { ...i, sceneAnalysis: undefined } : i))
+        );
+      });
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeImageId, sessionRestored]);
 
   // ── Auto-save: debounced 500ms after any state change ─────────────────────
 
@@ -401,6 +433,7 @@ export function WorkspaceProvider({ children, sessionId }: WorkspaceProviderProp
         image_id: activeImageId ?? "none",
         text,
         session_genre: sessionGenre,
+        session_brief: sessionBrief || null,
         current_adjustments: adjustments,
       });
 
