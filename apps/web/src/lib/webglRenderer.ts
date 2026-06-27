@@ -25,8 +25,9 @@
  */
 
 import * as twgl from "twgl.js";
-import type { AdjustmentState, HslAdjustments, ColorWheelState, WheelState } from "@/types";
-import { defaultHslAdjustments, defaultColorWheelState } from "@/types";
+import type { AdjustmentState, HslAdjustments, ColorWheelState, WheelState, CurveState } from "@/types";
+import { defaultHslAdjustments, defaultColorWheelState, defaultCurveState } from "@/types";
+import { buildCombinedLutData } from "./curveMath";
 
 // ─── Shaders ─────────────────────────────────────────────────────────────────
 
@@ -44,6 +45,8 @@ const FS = /* glsl */ `
   precision highp float;
   varying vec2 v_uv;
   uniform sampler2D u_image;
+  // 256×1 RGBA LUT: .r=composite .g=red .b=green .a=blue (last step in pipeline)
+  uniform sampler2D u_curve_lut;
 
   // Contain-fit geometry
   uniform float u_imageAspect;   // imageW / imageH
@@ -308,6 +311,18 @@ const FS = /* glsl */ `
       }
     }
 
+    // ── 15. Tone curve (LUT — spec section 1, LAST step in pipeline) ───────
+    // Composite curve applied uniformly to all channels first, then per-channel.
+    {
+      rgb.r = texture2D(u_curve_lut, vec2(rgb.r, 0.5)).r;
+      rgb.g = texture2D(u_curve_lut, vec2(rgb.g, 0.5)).r;
+      rgb.b = texture2D(u_curve_lut, vec2(rgb.b, 0.5)).r;
+      float r2 = texture2D(u_curve_lut, vec2(rgb.r, 0.5)).g;
+      float g2 = texture2D(u_curve_lut, vec2(rgb.g, 0.5)).b;
+      float b2 = texture2D(u_curve_lut, vec2(rgb.b, 0.5)).a;
+      rgb = vec3(r2, g2, b2);
+    }
+
     gl_FragColor = vec4(clamp(rgb, 0.0, 1.0), 1.0);
   }
 `;
@@ -354,10 +369,15 @@ export class WebGLRenderer {
   private texW = 1;
   private texH = 1;
 
+  /** Tone curve LUT texture — 256×1 RGBA. Updated lazily when curveState changes. */
+  private curveLutTexture: WebGLTexture | null = null;
+  private lastCurveState: CurveState | null = null;
+
   /** Latest-pending state for RAF batching. */
   private pendingAdj: AdjustmentState | null = null;
   private pendingHsl: HslAdjustments = defaultHslAdjustments;
   private pendingWheels: ColorWheelState = defaultColorWheelState;
+  private pendingCurves: CurveState = defaultCurveState;
   private rafId: number | null = null;
 
   constructor(canvas: HTMLCanvasElement) {
@@ -369,6 +389,30 @@ export class WebGLRenderer {
     this.bufferInfo = twgl.createBufferInfoFromArrays(gl, {
       a_position: { data: [-1, -1, 1, -1, -1, 1,  -1, 1, 1, -1, 1, 1], numComponents: 2 },
     });
+    // Pre-create LUT texture with identity mapping so shader always has a valid sampler
+    this._initCurveLut();
+  }
+
+  private _initCurveLut(): void {
+    const gl = this.gl;
+    const data = new Uint8Array(256 * 4);
+    for (let i = 0; i < 256; i++) { data[i*4]=i; data[i*4+1]=i; data[i*4+2]=i; data[i*4+3]=i; }
+    this.curveLutTexture = gl.createTexture();
+    gl.bindTexture(gl.TEXTURE_2D, this.curveLutTexture);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, 256, 1, 0, gl.RGBA, gl.UNSIGNED_BYTE, data);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+  }
+
+  private _updateCurveLut(curveState: CurveState): void {
+    if (curveState === this.lastCurveState) return;
+    this.lastCurveState = curveState;
+    const gl = this.gl;
+    const data = buildCombinedLutData(curveState);
+    gl.bindTexture(gl.TEXTURE_2D, this.curveLutTexture);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, 256, 1, 0, gl.RGBA, gl.UNSIGNED_BYTE, data);
   }
 
   /**
@@ -413,15 +457,17 @@ export class WebGLRenderer {
   render(
     adj: AdjustmentState = DEFAULT_ADJ,
     hsl: HslAdjustments = defaultHslAdjustments,
-    colorWheels: ColorWheelState = defaultColorWheelState
+    colorWheels: ColorWheelState = defaultColorWheelState,
+    curveState: CurveState = defaultCurveState
   ): void {
     this.pendingAdj = adj;
     this.pendingHsl = hsl;
     this.pendingWheels = colorWheels;
+    this.pendingCurves = curveState;
     if (this.rafId !== null) return; // already queued
     this.rafId = requestAnimationFrame(() => {
       this.rafId = null;
-      if (this.pendingAdj) this._draw(this.pendingAdj, this.pendingHsl, this.pendingWheels);
+      if (this.pendingAdj) this._draw(this.pendingAdj, this.pendingHsl, this.pendingWheels, this.pendingCurves);
       this.pendingAdj = null;
     });
   }
@@ -430,16 +476,17 @@ export class WebGLRenderer {
   drawSync(
     adj: AdjustmentState = DEFAULT_ADJ,
     hsl: HslAdjustments = defaultHslAdjustments,
-    colorWheels: ColorWheelState = defaultColorWheelState
+    colorWheels: ColorWheelState = defaultColorWheelState,
+    curveState: CurveState = defaultCurveState
   ): void {
     if (this.rafId !== null) {
       cancelAnimationFrame(this.rafId);
       this.rafId = null;
     }
-    this._draw(adj, hsl, colorWheels);
+    this._draw(adj, hsl, colorWheels, curveState);
   }
 
-  private _draw(adj: AdjustmentState, hsl: HslAdjustments, colorWheels: ColorWheelState): void {
+  private _draw(adj: AdjustmentState, hsl: HslAdjustments, colorWheels: ColorWheelState, curveState: CurveState): void {
     const gl = this.gl;
     if (!this.texture) return;
 
@@ -452,10 +499,13 @@ export class WebGLRenderer {
     gl.clearColor(0.039, 0.039, 0.039, 1); // zinc-950
     gl.clear(gl.COLOR_BUFFER_BIT);
 
+    this._updateCurveLut(curveState);
+
     gl.useProgram(this.programInfo.program);
     twgl.setBuffersAndAttributes(gl, this.programInfo, this.bufferInfo);
     twgl.setUniforms(this.programInfo, {
       u_image:        this.texture,
+      u_curve_lut:    this.curveLutTexture,
       u_texelSize:    [1 / this.texW, 1 / this.texH],
       u_imageAspect:  this.texW / this.texH,
       u_canvasAspect: cw / ch,
@@ -483,6 +533,7 @@ export class WebGLRenderer {
   destroy(): void {
     if (this.rafId !== null) { cancelAnimationFrame(this.rafId); this.rafId = null; }
     if (this.texture) { this.gl.deleteTexture(this.texture); this.texture = null; }
+    if (this.curveLutTexture) { this.gl.deleteTexture(this.curveLutTexture); this.curveLutTexture = null; }
   }
 }
 

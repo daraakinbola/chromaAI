@@ -59,6 +59,54 @@ export const defaultAdjustmentState: AdjustmentState = {
 
 export const defaultAdjustments = defaultAdjustmentState;
 
+// ─── Tone Curve (Phase 3 PRD Section 1) ─────────────────────────────────────
+
+export interface ParametricCurve {
+  highlights: number; // -100 to +100
+  lights:     number;
+  darks:      number;
+  shadows:    number;
+}
+
+export type CurveChannel = "composite" | "red" | "green" | "blue";
+
+export interface ToneCurve {
+  channel:    CurveChannel;
+  points:     Array<[number, number]>; // [input, output] pairs 0-255
+  mode:       "point" | "parametric";
+  parametric: ParametricCurve;
+}
+
+export interface CurveState {
+  composite:     ToneCurve;
+  red:           ToneCurve;
+  green:         ToneCurve;
+  blue:          ToneCurve;
+  activeChannel: CurveChannel;
+}
+
+function _identityCurve(channel: CurveChannel): ToneCurve {
+  return {
+    channel,
+    points:     [[0, 0], [255, 255]],
+    mode:       "point",
+    parametric: { highlights: 0, lights: 0, darks: 0, shadows: 0 },
+  };
+}
+
+/** Returns a fresh identity ToneCurve for the given channel. */
+export function identityToneCurve(channel: CurveChannel): ToneCurve {
+  return _identityCurve(channel);
+}
+
+export const defaultCurveState: CurveState = {
+  composite: _identityCurve("composite"),
+  red:       _identityCurve("red"),
+  green:     _identityCurve("green"),
+  blue:      _identityCurve("blue"),
+  activeChannel: "composite",
+};
+
 // ─── Color Wheels — Lift / Gamma / Gain ─────────────────────────────────────
 
 export interface WheelState {
@@ -238,5 +286,6 @@ export interface SessionRecord {
   promptHistory: PromptEntry[];
   hsl: HslAdjustments;
   colorWheels: ColorWheelState;
+  curves: CurveState;
   thumbnailDataUrl: string | null;
 }

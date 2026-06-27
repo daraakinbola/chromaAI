@@ -1,7 +1,7 @@
 import JSZip from "jszip";
 import { WebGLRenderer, webglSupported } from "@/lib/webglRenderer";
-import type { AdjustmentState, ColorWheelState, HslAdjustments, ImageRecord } from "@/types";
-import { defaultColorWheelState, defaultHslAdjustments } from "@/types";
+import type { AdjustmentState, ColorWheelState, CurveState, HslAdjustments, ImageRecord } from "@/types";
+import { defaultColorWheelState, defaultCurveState, defaultHslAdjustments } from "@/types";
 
 export type ExportFormat = "image/jpeg" | "image/png" | "image/webp";
 export type ExportResolution = "full" | "2k" | "1080p";
@@ -58,7 +58,8 @@ async function renderToBlob(
   options: ExportOptions,
   adjustments: AdjustmentState,
   hsl: HslAdjustments = defaultHslAdjustments,
-  colorWheels: ColorWheelState = defaultColorWheelState
+  colorWheels: ColorWheelState = defaultColorWheelState,
+  curveState: CurveState = defaultCurveState
 ): Promise<Blob> {
   const { format, quality, resolution } = options;
   const { width, height } = resolveResolution(image.width, image.height, resolution);
@@ -70,7 +71,7 @@ async function renderToBlob(
     const renderer = new WebGLRenderer(canvas);
     try {
       await renderer.loadImage(image.originalDataUrl);
-      renderer.drawSync(adjustments, hsl, colorWheels);
+      renderer.drawSync(adjustments, hsl, colorWheels, curveState);
       return await new Promise<Blob>((resolve, reject) => {
         canvas.toBlob(
           (b) => (b ? resolve(b) : reject(new Error("toBlob returned null"))),
@@ -119,9 +120,10 @@ export async function exportImage(
   options: ExportOptions,
   adjustments: AdjustmentState,
   hsl: HslAdjustments = defaultHslAdjustments,
-  colorWheels: ColorWheelState = defaultColorWheelState
+  colorWheels: ColorWheelState = defaultColorWheelState,
+  curveState: CurveState = defaultCurveState
 ): Promise<void> {
-  const blob = await renderToBlob(image, options, adjustments, hsl, colorWheels);
+  const blob = await renderToBlob(image, options, adjustments, hsl, colorWheels, curveState);
   triggerDownload(blob, outputFilename(image, options.format));
 }
 
@@ -137,14 +139,15 @@ export async function batchExportImages(
   options: ExportOptions,
   onProgress: (done: number, total: number) => void,
   hsl: HslAdjustments = defaultHslAdjustments,
-  colorWheels: ColorWheelState = defaultColorWheelState
+  colorWheels: ColorWheelState = defaultColorWheelState,
+  curveState: CurveState = defaultCurveState
 ): Promise<void> {
   const zip = new JSZip();
   const total = images.length;
 
   for (let i = 0; i < images.length; i++) {
     const image = images[i];
-    const blob = await renderToBlob(image, options, image.adjustments, hsl, colorWheels);
+    const blob = await renderToBlob(image, options, image.adjustments, hsl, colorWheels, curveState);
     zip.file(outputFilename(image, options.format), blob);
     onProgress(i + 1, total);
   }

@@ -11,6 +11,8 @@ import React, {
 import {
   AdjustmentState,
   ColorWheelState,
+  CurveChannel,
+  CurveState,
   HslAdjustments,
   ImageRecord,
   PromptEntry,
@@ -19,11 +21,14 @@ import {
   SessionGenre,
   SessionRecord,
   ToastItem,
+  ToneCurve,
   ViewMode,
   WheelState,
   defaultAdjustmentState,
   defaultColorWheelState,
+  defaultCurveState,
   defaultHslAdjustments,
+  identityToneCurve,
 } from "@/types";
 import { api } from "@/lib/api";
 import { importFiles } from "@/lib/imageImport";
@@ -46,6 +51,7 @@ interface WorkspaceState {
   adjustments: AdjustmentState;
   hsl: HslAdjustments;
   colorWheels: ColorWheelState;
+  curveState: CurveState;
   sessionGenre: SessionGenre | null;
   sessionBrief: string;
   sessionRestored: boolean;
@@ -62,6 +68,9 @@ interface WorkspaceState {
   isApplyingGrade: boolean;
   /** Base + all active reference contributions — what the canvas and export render. */
   effectiveAdjustments: AdjustmentState;
+  /** Targeted Adjustment Tool */
+  tatActive: boolean;
+  tatLuminance: number | null;
 }
 
 interface WorkspaceActions {
@@ -77,6 +86,12 @@ interface WorkspaceActions {
   ) => void;
   setColorWheel: (zone: keyof ColorWheelState, value: WheelState) => void;
   resetColorWheel: (zone: keyof ColorWheelState) => void;
+  setCurve: (channel: CurveChannel, curve: ToneCurve) => void;
+  setCurveActiveChannel: (channel: CurveChannel) => void;
+  resetCurve: (channel: CurveChannel) => void;
+  resetAllCurves: () => void;
+  setTatActive: (v: boolean) => void;
+  setTatLuminance: (v: number | null) => void;
   setViewMode: (mode: ViewMode) => void;
   submitPrompt: (text: string) => Promise<void>;
   dismissInterpretation: () => void;
@@ -112,6 +127,9 @@ export function WorkspaceProvider({ children, sessionId }: WorkspaceProviderProp
 
   const [hsl, setHslState] = useState<HslAdjustments>(defaultHslAdjustments);
   const [colorWheels, setColorWheelsState] = useState<ColorWheelState>(defaultColorWheelState);
+  const [curveState, setCurveState] = useState<CurveState>(defaultCurveState);
+  const [tatActive, setTatActiveState] = useState(false);
+  const [tatLuminance, setTatLuminanceState] = useState<number | null>(null);
   const [sessionGenre, setSessionGenreState] = useState<SessionGenre | null>(null);
   const [sessionBrief, setSessionBrief] = useState("");
   const [sessionCreatedAt, setSessionCreatedAt] = useState(Date.now());
@@ -158,6 +176,7 @@ export function WorkspaceProvider({ children, sessionId }: WorkspaceProviderProp
           setActiveImageId(record.activeImageId);
           setHslState(record.hsl);
           if (record.colorWheels) setColorWheelsState(record.colorWheels);
+          if (record.curves) setCurveState(record.curves);
           setSessionGenreState(record.genre);
           setSessionBrief(record.brief);
           setReferences(record.references);
@@ -263,6 +282,7 @@ export function WorkspaceProvider({ children, sessionId }: WorkspaceProviderProp
         promptHistory,
         hsl,
         colorWheels,
+        curves: curveState,
         thumbnailDataUrl: images[0]?.thumbnailDataUrl ?? null,
       };
       saveSession(record).catch(console.error);
@@ -272,7 +292,7 @@ export function WorkspaceProvider({ children, sessionId }: WorkspaceProviderProp
       if (saveTimerRef.current) clearTimeout(saveTimerRef.current);
     };
   }, [
-    images, activeImageId, references, promptHistory, hsl, colorWheels,
+    images, activeImageId, references, promptHistory, hsl, colorWheels, curveState,
     sessionGenre, sessionBrief, sessionRestored, sessionId,
     sessionCreatedAt,
   ]);
@@ -363,6 +383,27 @@ export function WorkspaceProvider({ children, sessionId }: WorkspaceProviderProp
       [zone]: { hue: 0, saturation: 0, luminance: 0 },
     }));
   };
+
+  // ── Tone curve actions ────────────────────────────────────────────────────
+
+  const setCurve = (channel: CurveChannel, curve: ToneCurve) => {
+    setCurveState((prev) => ({ ...prev, [channel]: curve }));
+  };
+
+  const setCurveActiveChannel = (channel: CurveChannel) => {
+    setCurveState((prev) => ({ ...prev, activeChannel: channel }));
+  };
+
+  const resetCurve = (channel: CurveChannel) => {
+    setCurveState((prev) => ({ ...prev, [channel]: identityToneCurve(channel) }));
+  };
+
+  const resetAllCurves = () => {
+    setCurveState(defaultCurveState);
+  };
+
+  const setTatActive = (v: boolean) => setTatActiveState(v);
+  const setTatLuminance = (v: number | null) => setTatLuminanceState(v);
 
   // ── Batch: apply grade to all (Section 6.3) ───────────────────────────────
 
@@ -546,6 +587,7 @@ export function WorkspaceProvider({ children, sessionId }: WorkspaceProviderProp
         adjustments,
         hsl,
         colorWheels,
+        curveState,
         sessionGenre,
         sessionBrief,
         sessionRestored,
@@ -561,6 +603,8 @@ export function WorkspaceProvider({ children, sessionId }: WorkspaceProviderProp
         batchConsistencyScore,
         isApplyingGrade,
         effectiveAdjustments,
+        tatActive,
+        tatLuminance,
         importImages,
         selectImage,
         setSessionGenre,
@@ -569,6 +613,12 @@ export function WorkspaceProvider({ children, sessionId }: WorkspaceProviderProp
         setHsl,
         setColorWheel,
         resetColorWheel,
+        setCurve,
+        setCurveActiveChannel,
+        resetCurve,
+        resetAllCurves,
+        setTatActive,
+        setTatLuminance,
         setViewMode,
         submitPrompt,
         dismissInterpretation,

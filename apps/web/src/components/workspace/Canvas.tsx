@@ -12,8 +12,9 @@ import { clsx } from "clsx";
 import { useWorkspace } from "@/context/WorkspaceContext";
 import { ACCEPTED_EXTENSIONS } from "@/lib/imageImport";
 import { WebGLRenderer, webglSupported } from "@/lib/webglRenderer";
-import type { AdjustmentState, ColorWheelState, HslAdjustments, ViewMode } from "@/types";
-import { defaultColorWheelState } from "@/types";
+import { buildCurveLUT, parametricToPoints } from "@/lib/curveMath";
+import type { AdjustmentState, ColorWheelState, CurveChannel, CurveState, HslAdjustments, ToneCurve, ViewMode } from "@/types";
+import { defaultColorWheelState, defaultCurveState } from "@/types";
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
@@ -112,7 +113,8 @@ function useWebGLCanvas(
   imageSrc: string | null,
   adjustments: AdjustmentState,
   hsl: HslAdjustments,
-  colorWheels: ColorWheelState
+  colorWheels: ColorWheelState,
+  curveState: CurveState
 ): { isReady: boolean } {
   const rendererRef = useRef<WebGLRenderer | null>(null);
   const [isReady, setIsReady] = useState(false);
@@ -122,6 +124,8 @@ function useWebGLCanvas(
   hslRef.current = hsl;
   const wheelsRef = useRef(colorWheels);
   wheelsRef.current = colorWheels;
+  const curvesRef = useRef(curveState);
+  curvesRef.current = curveState;
 
   // Destroy renderer on unmount only
   useEffect(() => {
@@ -141,7 +145,7 @@ function useWebGLCanvas(
       if (w && h && (canvas.width !== w || canvas.height !== h)) {
         canvas.width = w;
         canvas.height = h;
-        if (isReady) rendererRef.current?.render(adjRef.current, hslRef.current, wheelsRef.current);
+        if (isReady) rendererRef.current?.render(adjRef.current, hslRef.current, wheelsRef.current, curvesRef.current);
       }
     });
     obs.observe(canvas);
@@ -175,12 +179,12 @@ function useWebGLCanvas(
       .catch(console.error);
   }, [imageSrc]);
 
-  // Re-render when adjustments or HSL change (RAF-batched inside renderer)
+  // Re-render when adjustments, HSL, wheels, or curves change (RAF-batched inside renderer)
   useEffect(() => {
     if (!isReady) return;
-    rendererRef.current?.render(adjustments, hsl, colorWheels);
+    rendererRef.current?.render(adjustments, hsl, colorWheels, curveState);
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [adjustments, hsl, colorWheels, isReady]);
+  }, [adjustments, hsl, colorWheels, curveState, isReady]);
 
   return { isReady };
 }
@@ -188,11 +192,21 @@ function useWebGLCanvas(
 // ─── Canvas component ─────────────────────────────────────────────────────────
 
 export function Canvas() {
-  const { images, activeImageId, viewMode, setViewMode, adjustments, effectiveAdjustments, hsl, colorWheels, importImages } =
-    useWorkspace();
+  const {
+    images, activeImageId, viewMode, setViewMode,
+    adjustments, effectiveAdjustments, hsl, colorWheels, curveState, importImages,
+    tatActive, setTatActive, setTatLuminance, setCurve,
+  } = useWorkspace();
   const fileInputRef = useRef<HTMLInputElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
   const glCanvasRef  = useRef<HTMLCanvasElement>(null);
+
+  // TAT drag tracking
+  const tatDragRef = useRef<{
+    startY: number;
+    inputLum: number;
+    initialOutput: number;
+  } | null>(null);
 
   const [isShowingBefore, setIsShowingBefore] = useState(false);
   const [splitPos, setSplitPos]               = useState(0.5);
@@ -213,14 +227,82 @@ export function Canvas() {
 
   const activeImage = images.find((i) => i.id === activeImageId) ?? null;
 
-  // WebGL renderer — renders effectiveAdjustments + HSL + color wheels
+  // WebGL renderer — renders effectiveAdjustments + HSL + color wheels + tone curve
   const { isReady } = useWebGLCanvas(
     glCanvasRef,
     activeImage?.originalDataUrl ?? null,
     effectiveAdjustments,
     hsl,
-    colorWheels
+    colorWheels,
+    curveState
   );
+
+  // ── TAT helpers ────────────────────────────────────────────────────────────
+
+  const readLuminance = useCallback((clientX: number, clientY: number): number | null => {
+    const canvas = glCanvasRef.current;
+    if (!canvas || !isReady) return null;
+    const gl = canvas.getContext("webgl");
+    if (!gl) return null;
+    const rect = canvas.getBoundingClientRect();
+    const px = Math.floor((clientX - rect.left) * canvas.width / rect.width);
+    const py = Math.floor((clientY - rect.top) * canvas.height / rect.height);
+    if (px < 0 || px >= canvas.width || py < 0 || py >= canvas.height) return null;
+    const pixel = new Uint8Array(4);
+    gl.readPixels(px, canvas.height - 1 - py, 1, 1, gl.RGBA, gl.UNSIGNED_BYTE, pixel);
+    return Math.round(0.299 * pixel[0] + 0.587 * pixel[1] + 0.114 * pixel[2]);
+  }, [isReady]);
+
+  const handleTatPointerMove = useCallback((e: React.PointerEvent) => {
+    if (!tatActive) return;
+    const lum = readLuminance(e.clientX, e.clientY);
+    setTatLuminance(lum);
+    if (!tatDragRef.current) return;
+    const { startY, inputLum, initialOutput } = tatDragRef.current;
+    const dy = startY - e.clientY; // positive = dragged up = brighter output
+    const newOutput = Math.max(0, Math.min(255, Math.round(initialOutput + dy)));
+    const ch = curveState.activeChannel;
+    const curve = curveState[ch];
+    if (curve.mode !== "point") return;
+    const newPts = [...curve.points];
+    const idx = newPts.findIndex(([x]) => x === inputLum);
+    if (idx >= 0) newPts[idx] = [inputLum, newOutput];
+    setCurve(ch, { ...curve, points: newPts });
+  }, [tatActive, readLuminance, setTatLuminance, curveState, setCurve]);
+
+  const handleTatPointerDown = useCallback((e: React.PointerEvent) => {
+    if (!tatActive || e.button !== 0) return;
+    const lum = readLuminance(e.clientX, e.clientY);
+    if (lum === null) return;
+    const ch = curveState.activeChannel;
+    const curve = curveState[ch];
+    if (curve.mode !== "point") return;
+    const pts = curve.mode === "point"
+      ? curve.points
+      : parametricToPoints(curve.parametric);
+    const lut = buildCurveLUT(pts);
+    const currentOutput = Math.round(lut[lum] * 255);
+    tatDragRef.current = { startY: e.clientY, inputLum: lum, initialOutput: currentOutput };
+    // Add a control point at this luminance if one doesn't already exist (max 16 pts)
+    if (!curve.points.some(([x]) => x === lum) && curve.points.length < 16) {
+      const newPts = [...curve.points, [lum, currentOutput] as [number, number]]
+        .sort((a, b) => a[0] - b[0]);
+      setCurve(ch, { ...curve, points: newPts });
+    }
+    (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
+  }, [tatActive, readLuminance, curveState, setCurve]);
+
+  const handleTatPointerUp = useCallback(() => {
+    tatDragRef.current = null;
+  }, []);
+
+  // Escape key deactivates TAT
+  useEffect(() => {
+    if (!tatActive) return;
+    const handler = (e: KeyboardEvent) => { if (e.key === "Escape") setTatActive(false); };
+    window.addEventListener("keydown", handler);
+    return () => window.removeEventListener("keydown", handler);
+  }, [tatActive, setTatActive]);
 
   // Track container dimensions for containFit calculation and split clip math
   useLayoutEffect(() => {
@@ -285,6 +367,7 @@ export function Canvas() {
 
   const startPan = useCallback((e: React.MouseEvent) => {
     if (e.button !== 0) return;
+    if (tatActive) return; // TAT takes over pointer events
     e.preventDefault();
     panOriginRef.current = {
       startX: e.clientX,
@@ -449,9 +532,12 @@ export function Canvas() {
                 inset: 0,
                 transform: `translate(${pan.x}px, ${pan.y}px) scale(${zoom})`,
                 transformOrigin: "50% 50%",
-                cursor: isPanning ? "grabbing" : "grab",
+                cursor: tatActive ? "crosshair" : isPanning ? "grabbing" : "grab",
               }}
               onMouseDown={startPan}
+              onPointerDown={handleTatPointerDown}
+              onPointerMove={handleTatPointerMove}
+              onPointerUp={handleTatPointerUp}
             >
               {/*
                * WebGL canvas — always mounted so the GL context survives view-mode

@@ -5,6 +5,7 @@ import { ChevronDown, RotateCcw } from "lucide-react";
 import { clsx } from "clsx";
 import { Slider } from "@/components/ui/Slider";
 import { ColorWheel } from "@/components/ui/ColorWheel";
+import { ToneCurveEditor } from "@/components/ui/ToneCurveEditor";
 import { useWorkspace } from "@/context/WorkspaceContext";
 import { AdjustmentState, HslColor } from "@/types";
 
@@ -86,14 +87,6 @@ function HslSection() {
       <Slider label="Saturation" value={channel.saturation} min={-100} max={100} onChange={(v) => setHsl(activeColor, "saturation", v)} />
       <Slider label="Luminance" value={channel.luminance} min={-100} max={100} onChange={(v) => setHsl(activeColor, "luminance", v)} />
     </Section>
-  );
-}
-
-function ToneCurvePlaceholder() {
-  return (
-    <div className="w-full h-32 bg-zinc-900 rounded border border-zinc-800 flex items-center justify-center">
-      <span className="text-[10px] text-zinc-600">Tone curve editor</span>
-    </div>
   );
 }
 
@@ -179,7 +172,7 @@ export function AdjustmentPanel() {
         </Section>
 
         <Section title="Tone Curve" defaultOpen={false}>
-          <ToneCurvePlaceholder />
+          <ToneCurveEditor />
         </Section>
 
         <HslSection />

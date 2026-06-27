@@ -81,7 +81,7 @@ function BatchProgressBar({ done, total }: { done: number; total: number }) {
 // ─── Modal ────────────────────────────────────────────────────────────────────
 
 export function ExportModal({ onClose }: { onClose: () => void }) {
-  const { images, activeImageId, references, effectiveAdjustments, hsl, colorWheels } = useWorkspace();
+  const { images, activeImageId, references, effectiveAdjustments, hsl, colorWheels, curveState } = useWorkspace();
   const activeImage = images.find((i) => i.id === activeImageId);
 
   const [scope, setScope]           = useState<ExportScope>("active");
@@ -122,12 +122,13 @@ export function ExportModal({ onClose }: { onClose: () => void }) {
           { format, quality, resolution },
           (done, total) => setProgress({ done, total }),
           hsl,
-          colorWheels
+          colorWheels,
+          curveState
         );
       } else {
         if (!activeImage) return;
         // effectiveAdjustments already reflects base + active reference contributions
-        await exportImage(activeImage, { format, quality, resolution }, effectiveAdjustments, hsl, colorWheels);
+        await exportImage(activeImage, { format, quality, resolution }, effectiveAdjustments, hsl, colorWheels, curveState);
       }
       onClose();
     } catch (e) {

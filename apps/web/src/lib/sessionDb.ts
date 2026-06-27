@@ -1,5 +1,6 @@
 import { openDB, type IDBPDatabase } from "idb";
 import type { SessionRecord } from "@/types";
+import { defaultCurveState } from "@/types";
 
 const DB_NAME = "chromaai-sessions";
 const DB_VERSION = 1;
@@ -87,6 +88,7 @@ export async function createSession(
       gain:   { hue: 0, saturation: 0, luminance: 0 },
       offset: { hue: 0, saturation: 0, luminance: 0 },
     },
+    curves: defaultCurveState,
     thumbnailDataUrl: null,
   };
   await saveSession(record);
