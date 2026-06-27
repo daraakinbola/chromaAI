@@ -70,7 +70,7 @@ function EmptyCanvas({ onImport }: { onImport: () => void }) {
         </div>
         <div className="text-center">
           <p className="text-sm text-zinc-400 mb-1">No images imported</p>
-          <p className="text-xs text-zinc-600">Import JPEG, PNG, WebP, or TIFF files to begin grading</p>
+          <p className="text-xs text-zinc-600">Import JPEG, PNG, WebP, TIFF, or RAW files to begin grading</p>
         </div>
         <button
           onClick={onImport}
@@ -114,7 +114,9 @@ function useWebGLCanvas(
   adjustments: AdjustmentState,
   hsl: HslAdjustments,
   colorWheels: ColorWheelState,
-  curveState: CurveState
+  curveState: CurveState,
+  highlightRecovery: number,
+  shadowRecovery: number,
 ): { isReady: boolean } {
   const rendererRef = useRef<WebGLRenderer | null>(null);
   const [isReady, setIsReady] = useState(false);
@@ -126,6 +128,10 @@ function useWebGLCanvas(
   wheelsRef.current = colorWheels;
   const curvesRef = useRef(curveState);
   curvesRef.current = curveState;
+  const hrRef = useRef(highlightRecovery);
+  hrRef.current = highlightRecovery;
+  const srRef = useRef(shadowRecovery);
+  srRef.current = shadowRecovery;
 
   // Destroy renderer on unmount only
   useEffect(() => {
@@ -145,7 +151,7 @@ function useWebGLCanvas(
       if (w && h && (canvas.width !== w || canvas.height !== h)) {
         canvas.width = w;
         canvas.height = h;
-        if (isReady) rendererRef.current?.render(adjRef.current, hslRef.current, wheelsRef.current, curvesRef.current);
+        if (isReady) rendererRef.current?.render(adjRef.current, hslRef.current, wheelsRef.current, curvesRef.current, hrRef.current, srRef.current);
       }
     });
     obs.observe(canvas);
@@ -179,12 +185,12 @@ function useWebGLCanvas(
       .catch(console.error);
   }, [imageSrc]);
 
-  // Re-render when adjustments, HSL, wheels, or curves change (RAF-batched inside renderer)
+  // Re-render when adjustments, HSL, wheels, curves, or RAW recovery change
   useEffect(() => {
     if (!isReady) return;
-    rendererRef.current?.render(adjustments, hsl, colorWheels, curveState);
+    rendererRef.current?.render(adjustments, hsl, colorWheels, curveState, highlightRecovery, shadowRecovery);
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [adjustments, hsl, colorWheels, curveState, isReady]);
+  }, [adjustments, hsl, colorWheels, curveState, highlightRecovery, shadowRecovery, isReady]);
 
   return { isReady };
 }
@@ -196,6 +202,7 @@ export function Canvas() {
     images, activeImageId, viewMode, setViewMode,
     adjustments, effectiveAdjustments, hsl, colorWheels, curveState, importImages,
     tatActive, setTatActive, setTatLuminance, setCurve,
+    highlightRecovery, shadowRecovery,
   } = useWorkspace();
   const fileInputRef = useRef<HTMLInputElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
@@ -227,14 +234,16 @@ export function Canvas() {
 
   const activeImage = images.find((i) => i.id === activeImageId) ?? null;
 
-  // WebGL renderer — renders effectiveAdjustments + HSL + color wheels + tone curve
+  // WebGL renderer — renders effectiveAdjustments + HSL + color wheels + tone curve + RAW recovery
   const { isReady } = useWebGLCanvas(
     glCanvasRef,
     activeImage?.originalDataUrl ?? null,
     effectiveAdjustments,
     hsl,
     colorWheels,
-    curveState
+    curveState,
+    highlightRecovery,
+    shadowRecovery,
   );
 
   // ── TAT helpers ────────────────────────────────────────────────────────────

@@ -117,8 +117,13 @@ function ColorWheelSection({ disabled }: { disabled: boolean }) {
 }
 
 export function AdjustmentPanel() {
-  const { adjustments, setAdjustment, resetAdjustments, activeImageId, references } = useWorkspace();
+  const {
+    adjustments, setAdjustment, resetAdjustments, activeImageId, references,
+    highlightRecovery, shadowRecovery, activeImageIsRaw, setHighlightRecovery, setShadowRecovery,
+    images,
+  } = useWorkspace();
   const disabled = !activeImageId;
+  const activeImage = images.find((i) => i.id === activeImageId);
   const activeRefs = references.filter((r) => r.weight > 0);
 
   const adj = (key: keyof AdjustmentState) => ({
@@ -153,6 +158,32 @@ export function AdjustmentPanel() {
 
       {/* Scrollable sections */}
       <div className="flex-1 overflow-y-auto">
+        {activeImageIsRaw && (
+          <Section title="RAW">
+            <Slider
+              label="Highlight Recovery"
+              value={highlightRecovery}
+              min={0}
+              max={100}
+              onChange={setHighlightRecovery}
+              disabled={disabled}
+            />
+            <Slider
+              label="Shadow Recovery"
+              value={shadowRecovery}
+              min={0}
+              max={100}
+              onChange={setShadowRecovery}
+              disabled={disabled}
+            />
+            {activeImage?.rawMetadata?.cameraTemperature && (
+              <p className="text-[10px] text-zinc-500">
+                Camera WB: {activeImage.rawMetadata.cameraTemperature.toLocaleString()}K
+              </p>
+            )}
+          </Section>
+        )}
+
         <Section title="Basic">
           <Slider label="Exposure"   {...adj("exposure")}   min={-5}   max={5}   step={0.01} />
           <Slider label="Contrast"   {...adj("contrast")}   min={-100} max={100} />

@@ -71,6 +71,10 @@ interface WorkspaceState {
   /** Targeted Adjustment Tool */
   tatActive: boolean;
   tatLuminance: number | null;
+  /** RAW recovery — per active image, 0-100 */
+  highlightRecovery: number;
+  shadowRecovery: number;
+  activeImageIsRaw: boolean;
 }
 
 interface WorkspaceActions {
@@ -92,6 +96,8 @@ interface WorkspaceActions {
   resetAllCurves: () => void;
   setTatActive: (v: boolean) => void;
   setTatLuminance: (v: number | null) => void;
+  setHighlightRecovery: (v: number) => void;
+  setShadowRecovery: (v: number) => void;
   setViewMode: (mode: ViewMode) => void;
   submitPrompt: (text: string) => Promise<void>;
   dismissInterpretation: () => void;
@@ -150,6 +156,9 @@ export function WorkspaceProvider({ children, sessionId }: WorkspaceProviderProp
 
   const activeImage = images.find((i) => i.id === activeImageId);
   const adjustments = activeImage?.adjustments ?? defaultAdjustmentState;
+  const highlightRecovery = activeImage?.highlightRecovery ?? 0;
+  const shadowRecovery = activeImage?.shadowRecovery ?? 0;
+  const activeImageIsRaw = activeImage?.isRaw ?? false;
 
   // Spec Section 4.5: base + all active reference contributions.
   // Reactive: recomputes whenever references or the active image's base adjustments change.
@@ -405,6 +414,20 @@ export function WorkspaceProvider({ children, sessionId }: WorkspaceProviderProp
   const setTatActive = (v: boolean) => setTatActiveState(v);
   const setTatLuminance = (v: number | null) => setTatLuminanceState(v);
 
+  const setHighlightRecovery = (v: number) => {
+    if (!activeImageId) return;
+    setImages((prev) =>
+      prev.map((img) => img.id === activeImageId ? { ...img, highlightRecovery: v } : img)
+    );
+  };
+
+  const setShadowRecovery = (v: number) => {
+    if (!activeImageId) return;
+    setImages((prev) =>
+      prev.map((img) => img.id === activeImageId ? { ...img, shadowRecovery: v } : img)
+    );
+  };
+
   // ── Batch: apply grade to all (Section 6.3) ───────────────────────────────
 
   const applyGradeToAll = async (sourceImageId: string) => {
@@ -605,6 +628,9 @@ export function WorkspaceProvider({ children, sessionId }: WorkspaceProviderProp
         effectiveAdjustments,
         tatActive,
         tatLuminance,
+        highlightRecovery,
+        shadowRecovery,
+        activeImageIsRaw,
         importImages,
         selectImage,
         setSessionGenre,
@@ -619,6 +645,8 @@ export function WorkspaceProvider({ children, sessionId }: WorkspaceProviderProp
         resetAllCurves,
         setTatActive,
         setTatLuminance,
+        setHighlightRecovery,
+        setShadowRecovery,
         setViewMode,
         submitPrompt,
         dismissInterpretation,

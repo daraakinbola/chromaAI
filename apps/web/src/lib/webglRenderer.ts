@@ -48,6 +48,10 @@ const FS = /* glsl */ `
   // 256×1 RGBA LUT: .r=composite .g=red .b=green .a=blue (last step in pipeline)
   uniform sampler2D u_curve_lut;
 
+  // RAW recovery (Phase 3 Section 3)
+  uniform float u_highlight_recovery; // 0.0–1.0
+  uniform float u_shadow_recovery;    // 0.0–1.0
+
   // Contain-fit geometry
   uniform float u_imageAspect;   // imageW / imageH
   uniform float u_canvasAspect;  // canvas.width / canvas.height
@@ -311,7 +315,24 @@ const FS = /* glsl */ `
       }
     }
 
-    // ── 15. Tone curve (LUT — spec section 1, LAST step in pipeline) ───────
+    // ── 15. RAW highlight & shadow recovery ───────────────────────────────
+    // Soft highlight rolloff for near-white pixels; quadratic shadow lift.
+    if (u_highlight_recovery > 0.001) {
+      float lum = dot(rgb, vec3(0.299, 0.587, 0.114));
+      float lo = 1.0 - u_highlight_recovery * 0.45;
+      if (lum > lo) {
+        float t = (lum - lo) / max(1.0 - lo, 0.001);
+        float newLum = lo + (1.0 - lo) * (1.0 - exp(-t * 2.0));
+        rgb = rgb * (newLum / max(lum, 0.001));
+      }
+    }
+    if (u_shadow_recovery > 0.001) {
+      float lum = dot(rgb, vec3(0.299, 0.587, 0.114));
+      float lift = u_shadow_recovery * 0.15 * (1.0 - lum) * (1.0 - lum);
+      rgb = clamp(rgb + lift, 0.0, 1.0);
+    }
+
+    // ── 16. Tone curve (LUT — spec section 1, LAST step in pipeline) ───────
     // Composite curve applied uniformly to all channels first, then per-channel.
     {
       rgb.r = texture2D(u_curve_lut, vec2(rgb.r, 0.5)).r;
@@ -378,6 +399,8 @@ export class WebGLRenderer {
   private pendingHsl: HslAdjustments = defaultHslAdjustments;
   private pendingWheels: ColorWheelState = defaultColorWheelState;
   private pendingCurves: CurveState = defaultCurveState;
+  private pendingHighlightRecovery = 0;
+  private pendingShadowRecovery = 0;
   private rafId: number | null = null;
 
   constructor(canvas: HTMLCanvasElement) {
@@ -458,16 +481,23 @@ export class WebGLRenderer {
     adj: AdjustmentState = DEFAULT_ADJ,
     hsl: HslAdjustments = defaultHslAdjustments,
     colorWheels: ColorWheelState = defaultColorWheelState,
-    curveState: CurveState = defaultCurveState
+    curveState: CurveState = defaultCurveState,
+    highlightRecovery = 0,
+    shadowRecovery = 0,
   ): void {
     this.pendingAdj = adj;
     this.pendingHsl = hsl;
     this.pendingWheels = colorWheels;
     this.pendingCurves = curveState;
+    this.pendingHighlightRecovery = highlightRecovery;
+    this.pendingShadowRecovery = shadowRecovery;
     if (this.rafId !== null) return; // already queued
     this.rafId = requestAnimationFrame(() => {
       this.rafId = null;
-      if (this.pendingAdj) this._draw(this.pendingAdj, this.pendingHsl, this.pendingWheels, this.pendingCurves);
+      if (this.pendingAdj) this._draw(
+        this.pendingAdj, this.pendingHsl, this.pendingWheels, this.pendingCurves,
+        this.pendingHighlightRecovery, this.pendingShadowRecovery,
+      );
       this.pendingAdj = null;
     });
   }
@@ -477,16 +507,21 @@ export class WebGLRenderer {
     adj: AdjustmentState = DEFAULT_ADJ,
     hsl: HslAdjustments = defaultHslAdjustments,
     colorWheels: ColorWheelState = defaultColorWheelState,
-    curveState: CurveState = defaultCurveState
+    curveState: CurveState = defaultCurveState,
+    highlightRecovery = 0,
+    shadowRecovery = 0,
   ): void {
     if (this.rafId !== null) {
       cancelAnimationFrame(this.rafId);
       this.rafId = null;
     }
-    this._draw(adj, hsl, colorWheels, curveState);
+    this._draw(adj, hsl, colorWheels, curveState, highlightRecovery, shadowRecovery);
   }
 
-  private _draw(adj: AdjustmentState, hsl: HslAdjustments, colorWheels: ColorWheelState, curveState: CurveState): void {
+  private _draw(
+    adj: AdjustmentState, hsl: HslAdjustments, colorWheels: ColorWheelState,
+    curveState: CurveState, highlightRecovery = 0, shadowRecovery = 0,
+  ): void {
     const gl = this.gl;
     if (!this.texture) return;
 
@@ -521,10 +556,12 @@ export class WebGLRenderer {
       u_temperature:  adj.temperature,
       u_tint:         adj.tint,
       u_hsl:          flattenHsl(hsl),
-      u_lift_wheel:   wheelVec3(colorWheels.lift),
-      u_gamma_wheel:  wheelVec3(colorWheels.gamma),
-      u_gain_wheel:   wheelVec3(colorWheels.gain),
-      u_offset_wheel: wheelVec3(colorWheels.offset),
+      u_lift_wheel:          wheelVec3(colorWheels.lift),
+      u_gamma_wheel:         wheelVec3(colorWheels.gamma),
+      u_gain_wheel:          wheelVec3(colorWheels.gain),
+      u_offset_wheel:        wheelVec3(colorWheels.offset),
+      u_highlight_recovery:  highlightRecovery / 100,
+      u_shadow_recovery:     shadowRecovery / 100,
     });
     twgl.drawBufferInfo(gl, this.bufferInfo);
   }

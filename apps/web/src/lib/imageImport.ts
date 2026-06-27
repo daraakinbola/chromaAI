@@ -1,7 +1,8 @@
 import type { ImageRecord, AdjustmentState } from "@/types";
 import { defaultAdjustmentState } from "@/types";
+import { isRawFile, decodeRawFile } from "./rawDecoder";
 
-// Accepted types per Section 2.2 of Phase 2 TechSpec
+// Accepted types per Section 2.2 of Phase 2 TechSpec + Phase 3 RAW formats
 export const ACCEPTED_MIME_TYPES = new Set([
   "image/jpeg",
   "image/png",
@@ -11,7 +12,9 @@ export const ACCEPTED_MIME_TYPES = new Set([
 
 // Used as the <input accept="..."> attribute value
 export const ACCEPTED_EXTENSIONS =
-  ".jpg,.jpeg,.png,.webp,.tif,.tiff,image/jpeg,image/png,image/webp,image/tiff";
+  ".jpg,.jpeg,.png,.webp,.tif,.tiff" +
+  ",.arw,.cr2,.cr3,.nef,.nrw,.raf,.dng,.rw2,.orf,.rwl" +
+  ",image/jpeg,image/png,image/webp,image/tiff";
 
 const THUMB_W = 200;
 const THUMB_H = 133;
@@ -141,35 +144,51 @@ async function decodeTiffToDataUrl(file: File): Promise<string> {
 export async function importFile(file: File): Promise<ImageRecord> {
   const mimeType = file.type || "image/jpeg";
 
-  if (!ACCEPTED_MIME_TYPES.has(mimeType) && !isAcceptedByExtension(file.name)) {
+  const raw = isRawFile(file.name);
+  if (!raw && !ACCEPTED_MIME_TYPES.has(mimeType) && !isAcceptedByExtension(file.name)) {
     throw new Error(`Unsupported file type: ${file.name}`);
   }
 
   let dataUrl: string;
-  if (mimeType === "image/tiff" || /\.tiff?$/i.test(file.name)) {
+  let overrideWidth: number | null = null;
+  let overrideHeight: number | null = null;
+  let cameraTemperature: number | null = null;
+
+  if (raw) {
+    const result = await decodeRawFile(file);
+    dataUrl = result.dataUrl;
+    overrideWidth = result.width;
+    overrideHeight = result.height;
+    cameraTemperature = result.cameraTemperature;
+  } else if (mimeType === "image/tiff" || /\.tiff?$/i.test(file.name)) {
     dataUrl = await decodeTiffToDataUrl(file);
   } else {
-    // Step 2: FileReader.readAsDataURL() — result is the originalDataUrl
     dataUrl = await readFileAsDataUrl(file);
   }
 
-  // Step 3: decode to HTMLImageElement to get natural dimensions + thumbnail
+  // Decode to HTMLImageElement to get natural dimensions + thumbnail
   const img = await loadImage(dataUrl);
   const { thumbnailDataUrl, width, height } = generateThumbnail(img);
 
-  // Step 4: build ImageRecord with default AdjustmentState
   const record: ImageRecord = {
     id: crypto.randomUUID(),
     filename: file.name,
-    mimeType,
-    originalDataUrl: dataUrl, // never mutated after this point
+    mimeType: raw ? "image/png" : mimeType,
+    originalDataUrl: dataUrl,
     thumbnailDataUrl,
-    width,
-    height,
+    width: overrideWidth ?? width,
+    height: overrideHeight ?? height,
     importedAt: Date.now(),
-    adjustments: { ...defaultAdjustmentState },
-    consistencyScore: 100,  // recalculated by batch engine after import
+    adjustments: {
+      ...defaultAdjustmentState,
+      ...(cameraTemperature !== null ? { temperature: cameraTemperature } : {}),
+    },
+    consistencyScore: 100,
     flagged: false,
+    isRaw: raw || undefined,
+    rawMetadata: cameraTemperature !== null ? { cameraTemperature } : undefined,
+    highlightRecovery: 0,
+    shadowRecovery: 0,
   };
 
   return record;

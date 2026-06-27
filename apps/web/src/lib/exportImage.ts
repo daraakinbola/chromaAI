@@ -69,9 +69,11 @@ async function renderToBlob(
     canvas.width = width;
     canvas.height = height;
     const renderer = new WebGLRenderer(canvas);
+    const hr = image.highlightRecovery ?? 0;
+    const sr = image.shadowRecovery ?? 0;
     try {
       await renderer.loadImage(image.originalDataUrl);
-      renderer.drawSync(adjustments, hsl, colorWheels, curveState);
+      renderer.drawSync(adjustments, hsl, colorWheels, curveState, hr, sr);
       return await new Promise<Blob>((resolve, reject) => {
         canvas.toBlob(
           (b) => (b ? resolve(b) : reject(new Error("toBlob returned null"))),

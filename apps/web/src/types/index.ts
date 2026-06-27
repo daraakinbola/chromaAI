@@ -38,6 +38,11 @@ export interface ImageRecord {
   flagged: boolean;        // manually flagged by user
   /** undefined = not yet triggered; null = in-flight; SceneAnalysis = complete */
   sceneAnalysis?: SceneAnalysis | null;
+  // ── RAW file fields (Phase 3 Section 3) ──────────────────────────────
+  isRaw?: boolean;
+  rawMetadata?: { cameraTemperature: number };
+  highlightRecovery: number; // 0-100, RAW highlight rolloff recovery
+  shadowRecovery: number;    // 0-100, RAW shadow lift
 }
 
 // Backward-compat alias — existing code can keep using Adjustments

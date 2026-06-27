@@ -120,6 +120,11 @@ function Thumbnail({
           </span>
         </div>
       )}
+      {image.isRaw && (
+        <span className="absolute top-1 left-1 text-[8px] font-mono font-bold bg-amber-500/80 text-white px-1 py-0.5 rounded leading-none z-10">
+          RAW
+        </span>
+      )}
       <div className="absolute bottom-0 left-0 right-0 bg-black/60 px-1.5 py-0.5 flex items-center justify-between">
         <ConsistencyBadge score={image.consistencyScore} />
         {image.flagged && <Flag className="w-2.5 h-2.5 text-amber-400" />}
@@ -357,6 +362,7 @@ export function ImageBrowser() {
                   <p className="text-[11px] truncate">{img.filename}</p>
                   <p className="text-[9px] text-zinc-600">
                     {img.width}×{img.height}
+                    {img.isRaw && <span className="ml-1 text-amber-400">RAW</span>}
                   </p>
                 </div>
                 <ConsistencyBadge score={img.consistencyScore} />
