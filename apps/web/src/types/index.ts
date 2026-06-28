@@ -277,6 +277,47 @@ export interface BatchAdaptResponse {
   adjustments: ImageAdjustmentResult[];
 }
 
+// ─── Masks / Local Adjustments (Phase 3 PRD Section 4) ──────────────────────
+
+export type MaskType = "subject" | "sky" | "background" | "luminance" | "color" | "brush";
+
+export interface LuminanceMaskParams {
+  min: number; // 0-255
+  max: number; // 0-255
+}
+
+export interface ColorMaskParams {
+  hue: number;      // 0-360 center hue
+  hueRange: number; // ±degrees around center hue
+  satMin: number;   // 0.0-1.0 minimum saturation threshold
+}
+
+export interface Mask {
+  id: string;
+  type: MaskType;
+  /** Grayscale PNG as data URL. Null while API mask is loading. */
+  maskPng: string | null;
+  maskWidth: number;
+  maskHeight: number;
+  inverted: boolean;
+  featherRadius: number;
+  adjustments: AdjustmentState;
+  visible: boolean;
+  luminanceParams?: LuminanceMaskParams;
+  colorParams?: ColorMaskParams;
+  isLoading: boolean;
+}
+
+export interface LocalAdjustmentLayer {
+  id: string;
+  name: string;
+  type: MaskType;
+  mask: Mask | null;
+  adjustments: AdjustmentState;
+  opacity: number;  // 0.0 to 1.0
+  visible: boolean;
+}
+
 // ─── Session persistence (Section 7 of Phase 2 TechSpec) ─────────────────────
 
 export interface SessionRecord {
@@ -292,5 +333,6 @@ export interface SessionRecord {
   hsl: HslAdjustments;
   colorWheels: ColorWheelState;
   curves: CurveState;
+  localLayers: LocalAdjustmentLayer[];
   thumbnailDataUrl: string | null;
 }

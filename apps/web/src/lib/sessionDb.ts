@@ -90,6 +90,7 @@ export async function createSession(
     },
     curves: defaultCurveState,
     thumbnailDataUrl: null,
+    localLayers: [],
   };
   await saveSession(record);
 }

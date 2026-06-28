@@ -15,6 +15,11 @@ import {
   CurveState,
   HslAdjustments,
   ImageRecord,
+  LocalAdjustmentLayer,
+  LuminanceMaskParams,
+  ColorMaskParams,
+  Mask,
+  MaskType,
   PromptEntry,
   ReferenceImage,
   SceneAnalysis,
@@ -32,6 +37,20 @@ import {
 } from "@/types";
 import { api } from "@/lib/api";
 import { importFiles } from "@/lib/imageImport";
+import {
+  getMaskResolution,
+  getImagePixelData,
+  generateLuminanceMask,
+  generateColorRangeMask,
+  maskToPng,
+  pngToMask,
+  gaussianBlurMask,
+  invertMask,
+  createEmptyMaskPng,
+} from "@/lib/maskUtils";
+import { getMaskWorker, getImageWorker } from "@/lib/workerBridge";
+import { detectWebGPU } from "@/lib/webglRenderer";
+import { estimateSessionBytes, formatSessionSize, isApproachingMemoryLimit } from "@/lib/memoryGuard";
 import { applyReferencesToAdjustments, importReference as doImportReference } from "@/lib/referenceExtract";
 import { deleteExpiredSessions, getSession, saveSession } from "@/lib/sessionDb";
 import { computeBatchConsistency } from "@/lib/consistencyEngine";
@@ -75,6 +94,11 @@ interface WorkspaceState {
   highlightRecovery: number;
   shadowRecovery: number;
   activeImageIsRaw: boolean;
+  /** Local adjustment layers (Phase 3 PRD Section 4) */
+  localLayers: LocalAdjustmentLayer[];
+  activeBrushLayerId: string | null;
+  brushSize: number;
+  brushHardness: number;
 }
 
 interface WorkspaceActions {
@@ -113,6 +137,20 @@ interface WorkspaceActions {
   dismissToast: (id: string) => void;
   applyGradeToAll: (sourceImageId: string) => Promise<void>;
   unflagImage: (id: string) => void;
+  addLocalLayer: (type: MaskType, imageDataUrl: string, imageWidth: number, imageHeight: number) => Promise<void>;
+  removeLocalLayer: (id: string) => void;
+  setLayerAdjustment: (layerId: string, key: keyof AdjustmentState, value: number) => void;
+  setLayerOpacity: (layerId: string, opacity: number) => void;
+  toggleLayerVisibility: (layerId: string) => void;
+  setLayerInverted: (layerId: string, inverted: boolean) => void;
+  setLayerFeather: (layerId: string, radius: number) => void;
+  updateLayerLuminanceParams: (layerId: string, params: LuminanceMaskParams) => Promise<void>;
+  updateLayerColorParams: (layerId: string, params: ColorMaskParams) => Promise<void>;
+  commitBrushMask: (layerId: string, maskPng: string) => void;
+  setActiveBrushLayer: (layerId: string | null) => void;
+  setBrushSize: (size: number) => void;
+  setBrushHardness: (hardness: number) => void;
+  sampleColorFromImage: (imageDataUrl: string, x: number, y: number, imageWidth: number, imageHeight: number) => Promise<number>;
 }
 
 const WorkspaceContext = createContext<(WorkspaceState & WorkspaceActions) | null>(null);
@@ -134,6 +172,10 @@ export function WorkspaceProvider({ children, sessionId }: WorkspaceProviderProp
   const [hsl, setHslState] = useState<HslAdjustments>(defaultHslAdjustments);
   const [colorWheels, setColorWheelsState] = useState<ColorWheelState>(defaultColorWheelState);
   const [curveState, setCurveState] = useState<CurveState>(defaultCurveState);
+  const [localLayers, setLocalLayers] = useState<LocalAdjustmentLayer[]>([]);
+  const [activeBrushLayerId, setActiveBrushLayerId] = useState<string | null>(null);
+  const [brushSize, setBrushSizeState] = useState(40);
+  const [brushHardness, setBrushHardnessState] = useState(0.5);
   const [tatActive, setTatActiveState] = useState(false);
   const [tatLuminance, setTatLuminanceState] = useState<number | null>(null);
   const [sessionGenre, setSessionGenreState] = useState<SessionGenre | null>(null);
@@ -171,6 +213,10 @@ export function WorkspaceProvider({ children, sessionId }: WorkspaceProviderProp
   // ── Session restore on mount ───────────────────────────────────────────────
 
   useEffect(() => {
+    // PRD §5.5: log a console.warn if WebGPU is available so developers know
+    // we're using WebGL instead. No user-visible error (acceptance criterion).
+    detectWebGPU();
+
     if (!sessionId) {
       setSessionRestored(true);
       return;
@@ -186,6 +232,7 @@ export function WorkspaceProvider({ children, sessionId }: WorkspaceProviderProp
           setHslState(record.hsl);
           if (record.colorWheels) setColorWheelsState(record.colorWheels);
           if (record.curves) setCurveState(record.curves);
+          if (record.localLayers) setLocalLayers(record.localLayers);
           setSessionGenreState(record.genre);
           setSessionBrief(record.brief);
           setReferences(record.references);
@@ -292,6 +339,7 @@ export function WorkspaceProvider({ children, sessionId }: WorkspaceProviderProp
         hsl,
         colorWheels,
         curves: curveState,
+        localLayers,
         thumbnailDataUrl: images[0]?.thumbnailDataUrl ?? null,
       };
       saveSession(record).catch(console.error);
@@ -302,8 +350,7 @@ export function WorkspaceProvider({ children, sessionId }: WorkspaceProviderProp
     };
   }, [
     images, activeImageId, references, promptHistory, hsl, colorWheels, curveState,
-    sessionGenre, sessionBrief, sessionRestored, sessionId,
-    sessionCreatedAt,
+    localLayers, sessionGenre, sessionBrief, sessionRestored, sessionId, sessionCreatedAt,
   ]);
 
   // ── Toast helpers ─────────────────────────────────────────────────────────
@@ -331,6 +378,10 @@ export function WorkspaceProvider({ children, sessionId }: WorkspaceProviderProp
     );
 
     if (records.length) {
+      // Snapshot current images so we can estimate post-import memory size
+      // before the React state flush (images captured from the enclosing closure).
+      const projectedImages = [...images, ...records];
+
       setImages((prev) => {
         const updated = [...prev, ...records];
         if (!activeImageId) {
@@ -338,6 +389,33 @@ export function WorkspaceProvider({ children, sessionId }: WorkspaceProviderProp
         }
         return updated;
       });
+
+      // PRD §5.5: warn when approaching the 2 GB in-memory limit.
+      if (isApproachingMemoryLimit(projectedImages)) {
+        addToast({
+          type: "info",
+          message: `Session size is ~${formatSessionSize(estimateSessionBytes(projectedImages))}. Consider removing unused images to stay under the 2 GB limit.`,
+        });
+      }
+
+      // Fire-and-forget: regenerate thumbnails in parallel via imageWorker (PRD Section 5.2).
+      // The sync thumbnail from importFiles is already visible; the worker version overwrites
+      // it in the background without blocking the import completion.
+      const imageWorker = getImageWorker();
+      if (imageWorker) {
+        Promise.all(
+          records.map(async (rec) => {
+            try {
+              const thumb = await imageWorker.generateThumbnail(rec.originalDataUrl);
+              setImages((prev) =>
+                prev.map((img) => img.id === rec.id ? { ...img, thumbnailDataUrl: thumb } : img)
+              );
+            } catch {
+              // keep the sync thumbnail on worker failure
+            }
+          })
+        );
+      }
     }
 
     setIsImporting(false);
@@ -426,6 +504,238 @@ export function WorkspaceProvider({ children, sessionId }: WorkspaceProviderProp
     setImages((prev) =>
       prev.map((img) => img.id === activeImageId ? { ...img, shadowRecovery: v } : img)
     );
+  };
+
+  // ── Local adjustment layer actions (Phase 3 PRD Section 4) ───────────────
+
+  const _defaultLayerAdj: AdjustmentState = { ...defaultAdjustmentState };
+
+  async function _buildMask(
+    type: MaskType,
+    imageDataUrl: string,
+    imageWidth: number,
+    imageHeight: number,
+    lumParams?: LuminanceMaskParams,
+    colorParams?: ColorMaskParams,
+  ): Promise<{ maskPng: string; maskWidth: number; maskHeight: number }> {
+    const { w, h } = getMaskResolution(imageWidth, imageHeight);
+    if (type === "luminance") {
+      const params = lumParams ?? { min: 0, max: 255 };
+      const worker = getMaskWorker();
+      if (worker) {
+        const maskPng = await worker.generateLuminanceMaskPng(imageDataUrl, w, h, params, 0, false);
+        return { maskPng, maskWidth: w, maskHeight: h };
+      }
+      // Fallback: main-thread generation
+      const pixels = await getImagePixelData(imageDataUrl, w, h);
+      const mask = generateLuminanceMask(pixels, params.min, params.max);
+      return { maskPng: maskToPng(mask, w, h), maskWidth: w, maskHeight: h };
+    }
+    if (type === "color") {
+      const params = colorParams ?? { hue: 0, hueRange: 30, satMin: 0.15 };
+      const worker = getMaskWorker();
+      if (worker) {
+        const maskPng = await worker.generateColorRangeMaskPng(imageDataUrl, w, h, params, 0, false);
+        return { maskPng, maskWidth: w, maskHeight: h };
+      }
+      // Fallback: main-thread generation
+      const pixels = await getImagePixelData(imageDataUrl, w, h);
+      const mask = generateColorRangeMask(pixels, params.hue, params.hueRange, params.satMin);
+      return { maskPng: maskToPng(mask, w, h), maskWidth: w, maskHeight: h };
+    }
+    if (type === "brush") {
+      return { maskPng: createEmptyMaskPng(w, h), maskWidth: w, maskHeight: h };
+    }
+    // subject / sky / background — API call
+    const apiMethod = type === "subject" ? api.masks.subject
+      : type === "sky" ? api.masks.sky
+      : api.masks.background;
+    const res = await apiMethod(imageDataUrl);
+    return { maskPng: res.mask_png, maskWidth: res.width, maskHeight: res.height };
+  }
+
+  const addLocalLayer = async (
+    type: MaskType,
+    imageDataUrl: string,
+    imageWidth: number,
+    imageHeight: number,
+  ) => {
+    const id = crypto.randomUUID();
+    const name = type === "subject" ? "Subject" : type === "sky" ? "Sky"
+      : type === "background" ? "Background" : type === "luminance" ? "Luminance Range"
+      : type === "color" ? "Color Range" : "Brush";
+
+    const { w, h } = getMaskResolution(imageWidth, imageHeight);
+    const defaultLumParams: LuminanceMaskParams = { min: 128, max: 255 };
+    const defaultColorParams: ColorMaskParams = { hue: 0, hueRange: 30, satMin: 0.15 };
+
+    // Insert layer immediately with isLoading=true for API types
+    const maskBase: Mask = {
+      id: crypto.randomUUID(),
+      type,
+      maskPng: type === "brush" ? createEmptyMaskPng(w, h) : null,
+      maskWidth: w,
+      maskHeight: h,
+      inverted: false,
+      featherRadius: 0,
+      adjustments: { ..._defaultLayerAdj },
+      visible: true,
+      isLoading: type !== "brush" && type !== "luminance" && type !== "color",
+      luminanceParams: defaultLumParams,
+      colorParams: defaultColorParams,
+    };
+    const newLayer: LocalAdjustmentLayer = {
+      id, name, type, mask: maskBase,
+      adjustments: { ..._defaultLayerAdj },
+      opacity: 1,
+      visible: true,
+    };
+    setLocalLayers((prev) => [...prev, newLayer]);
+    if (type === "brush") {
+      setActiveBrushLayerId(id);
+      return;
+    }
+
+    // Generate / fetch mask
+    try {
+      const { maskPng, maskWidth, maskHeight } = await _buildMask(
+        type, imageDataUrl, imageWidth, imageHeight, defaultLumParams, defaultColorParams,
+      );
+      setLocalLayers((prev) => prev.map((l) =>
+        l.id !== id ? l : {
+          ...l,
+          mask: l.mask ? {
+            ...l.mask,
+            maskPng,
+            maskWidth,
+            maskHeight,
+            isLoading: false,
+          } : null,
+        }
+      ));
+    } catch (err) {
+      addToast({ type: "error", message: `Mask generation failed: ${err instanceof Error ? err.message : String(err)}` });
+      setLocalLayers((prev) => prev.map((l) =>
+        l.id !== id ? l : { ...l, mask: l.mask ? { ...l.mask, isLoading: false } : null }
+      ));
+    }
+  };
+
+  const removeLocalLayer = (id: string) => {
+    setLocalLayers((prev) => prev.filter((l) => l.id !== id));
+    if (activeBrushLayerId === id) setActiveBrushLayerId(null);
+  };
+
+  const setLayerAdjustment = (layerId: string, key: keyof AdjustmentState, value: number) => {
+    setLocalLayers((prev) =>
+      prev.map((l) => l.id === layerId ? { ...l, adjustments: { ...l.adjustments, [key]: value } } : l)
+    );
+  };
+
+  const setLayerOpacity = (layerId: string, opacity: number) => {
+    setLocalLayers((prev) => prev.map((l) => l.id === layerId ? { ...l, opacity } : l));
+  };
+
+  const toggleLayerVisibility = (layerId: string) => {
+    setLocalLayers((prev) =>
+      prev.map((l) => l.id === layerId ? { ...l, visible: !l.visible } : l)
+    );
+  };
+
+  const setLayerInverted = (layerId: string, inverted: boolean) => {
+    setLocalLayers((prev) =>
+      prev.map((l) => {
+        if (l.id !== layerId || !l.mask) return l;
+        return { ...l, mask: { ...l.mask, inverted } };
+      })
+    );
+  };
+
+  const setLayerFeather = (layerId: string, radius: number) => {
+    setLocalLayers((prev) =>
+      prev.map((l) => {
+        if (l.id !== layerId || !l.mask) return l;
+        return { ...l, mask: { ...l.mask, featherRadius: radius } };
+      })
+    );
+  };
+
+  const updateLayerLuminanceParams = async (layerId: string, params: LuminanceMaskParams) => {
+    const layer = localLayers.find((l) => l.id === layerId);
+    if (!layer?.mask || !activeImage) return;
+    const { w, h } = getMaskResolution(activeImage.width, activeImage.height);
+    const { featherRadius, inverted } = layer.mask;
+
+    const worker = getMaskWorker();
+    let maskPng: string;
+    if (worker) {
+      maskPng = await worker.generateLuminanceMaskPng(
+        activeImage.originalDataUrl, w, h, params, featherRadius, inverted,
+      );
+    } else {
+      const pixels = await getImagePixelData(activeImage.originalDataUrl, w, h);
+      let mask = generateLuminanceMask(pixels, params.min, params.max);
+      if (featherRadius > 0) mask = gaussianBlurMask(mask, w, h, featherRadius);
+      if (inverted) mask = invertMask(mask);
+      maskPng = maskToPng(mask, w, h);
+    }
+
+    setLocalLayers((prev) =>
+      prev.map((l) =>
+        l.id !== layerId || !l.mask ? l
+          : { ...l, mask: { ...l.mask, maskPng, maskWidth: w, maskHeight: h, luminanceParams: params } }
+      )
+    );
+  };
+
+  const updateLayerColorParams = async (layerId: string, params: ColorMaskParams) => {
+    const layer = localLayers.find((l) => l.id === layerId);
+    if (!layer?.mask || !activeImage) return;
+    const { w, h } = getMaskResolution(activeImage.width, activeImage.height);
+    const { featherRadius, inverted } = layer.mask;
+
+    const worker = getMaskWorker();
+    let maskPng: string;
+    if (worker) {
+      maskPng = await worker.generateColorRangeMaskPng(
+        activeImage.originalDataUrl, w, h, params, featherRadius, inverted,
+      );
+    } else {
+      const pixels = await getImagePixelData(activeImage.originalDataUrl, w, h);
+      let mask = generateColorRangeMask(pixels, params.hue, params.hueRange, params.satMin);
+      if (featherRadius > 0) mask = gaussianBlurMask(mask, w, h, featherRadius);
+      if (inverted) mask = invertMask(mask);
+      maskPng = maskToPng(mask, w, h);
+    }
+
+    setLocalLayers((prev) =>
+      prev.map((l) =>
+        l.id !== layerId || !l.mask ? l
+          : { ...l, mask: { ...l.mask, maskPng, maskWidth: w, maskHeight: h, colorParams: params } }
+      )
+    );
+  };
+
+  const commitBrushMask = (layerId: string, maskPng: string) => {
+    setLocalLayers((prev) =>
+      prev.map((l) =>
+        l.id !== layerId || !l.mask ? l : { ...l, mask: { ...l.mask, maskPng } }
+      )
+    );
+  };
+
+  const setActiveBrushLayer = (layerId: string | null) => setActiveBrushLayerId(layerId);
+  const setBrushSize = (size: number) => setBrushSizeState(size);
+  const setBrushHardness = (hardness: number) => setBrushHardnessState(hardness);
+
+  const sampleColorFromImage = async (
+    imageDataUrl: string, x: number, y: number, imageWidth: number, imageHeight: number,
+  ): Promise<number> => {
+    const { w, h } = getMaskResolution(imageWidth, imageHeight);
+    const sx = (x / imageWidth) * w, sy = (y / imageHeight) * h;
+    const pixels = await getImagePixelData(imageDataUrl, w, h);
+    const { sampleHue } = await import("@/lib/maskUtils");
+    return sampleHue(pixels, sx, sy);
   };
 
   // ── Batch: apply grade to all (Section 6.3) ───────────────────────────────
@@ -631,6 +941,10 @@ export function WorkspaceProvider({ children, sessionId }: WorkspaceProviderProp
         highlightRecovery,
         shadowRecovery,
         activeImageIsRaw,
+        localLayers,
+        activeBrushLayerId,
+        brushSize,
+        brushHardness,
         importImages,
         selectImage,
         setSessionGenre,
@@ -658,6 +972,20 @@ export function WorkspaceProvider({ children, sessionId }: WorkspaceProviderProp
         dismissToast,
         applyGradeToAll,
         unflagImage,
+        addLocalLayer,
+        removeLocalLayer,
+        setLayerAdjustment,
+        setLayerOpacity,
+        toggleLayerVisibility,
+        setLayerInverted,
+        setLayerFeather,
+        updateLayerLuminanceParams,
+        updateLayerColorParams,
+        commitBrushMask,
+        setActiveBrushLayer,
+        setBrushSize,
+        setBrushHardness,
+        sampleColorFromImage,
       }}
     >
       {children}

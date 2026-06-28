@@ -6,6 +6,7 @@ import { clsx } from "clsx";
 import { Slider } from "@/components/ui/Slider";
 import { ColorWheel } from "@/components/ui/ColorWheel";
 import { ToneCurveEditor } from "@/components/ui/ToneCurveEditor";
+import { LocalAdjustmentsPanel } from "@/components/workspace/LocalAdjustmentsPanel";
 import { useWorkspace } from "@/context/WorkspaceContext";
 import { AdjustmentState, HslColor } from "@/types";
 
@@ -210,6 +211,10 @@ export function AdjustmentPanel() {
 
         <Section title="Color Wheels" defaultOpen={false}>
           <ColorWheelSection disabled={disabled} />
+        </Section>
+
+        <Section title="Local Adjustments" defaultOpen={false}>
+          <LocalAdjustmentsPanel />
         </Section>
 
         {/* AI override disclosure */}

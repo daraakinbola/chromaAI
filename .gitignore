@@ -13,3 +13,6 @@ venv/
 uploads/
 previews/
 .DS_Store
+*.tsbuildinfo
+*.log
+.claude/

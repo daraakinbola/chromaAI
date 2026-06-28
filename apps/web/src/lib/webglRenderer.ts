@@ -29,6 +29,12 @@ import type { AdjustmentState, HslAdjustments, ColorWheelState, WheelState, Curv
 import { defaultHslAdjustments, defaultColorWheelState, defaultCurveState } from "@/types";
 import { buildCombinedLutData } from "./curveMath";
 
+/** One active local adjustment layer passed to the renderer each frame. */
+export interface RendererLocalLayer {
+  opacity: number;
+  adjustments: AdjustmentState;
+}
+
 // ─── Shaders ─────────────────────────────────────────────────────────────────
 
 const VS = /* glsl */ `
@@ -38,6 +44,17 @@ const VS = /* glsl */ `
     gl_Position = vec4(a_position, 0.0, 1.0);
     // NDC (-1..1) → UV (0..1), flip Y so (0,0) is top-left
     v_uv = vec2(a_position.x * 0.5 + 0.5, 0.5 - a_position.y * 0.5);
+  }
+`;
+
+// Minimal pass-through shader — used by renderFromCache() to blit cached pixels
+// back to the canvas without running the full adjustment pipeline.
+const FS_PT = /* glsl */ `
+  precision mediump float;
+  varying vec2 v_uv;
+  uniform sampler2D u_cache;
+  void main() {
+    gl_FragColor = texture2D(u_cache, v_uv);
   }
 `;
 
@@ -81,6 +98,21 @@ const FS = /* glsl */ `
   uniform vec3 u_gain_wheel;
   uniform vec3 u_offset_wheel;
 
+  // Local adjustment layers (Phase 3 PRD Section 4.5) — up to 4 layers
+  // Each layer: mask texture + active flag + opacity + 10 basic adjustments
+  uniform sampler2D u_mask0; uniform float u_l0_active, u_l0_opacity,
+    u_l0_exp, u_l0_cont, u_l0_hl, u_l0_sh, u_l0_wh, u_l0_bl,
+    u_l0_temp, u_l0_tint, u_l0_sat, u_l0_vib;
+  uniform sampler2D u_mask1; uniform float u_l1_active, u_l1_opacity,
+    u_l1_exp, u_l1_cont, u_l1_hl, u_l1_sh, u_l1_wh, u_l1_bl,
+    u_l1_temp, u_l1_tint, u_l1_sat, u_l1_vib;
+  uniform sampler2D u_mask2; uniform float u_l2_active, u_l2_opacity,
+    u_l2_exp, u_l2_cont, u_l2_hl, u_l2_sh, u_l2_wh, u_l2_bl,
+    u_l2_temp, u_l2_tint, u_l2_sat, u_l2_vib;
+  uniform sampler2D u_mask3; uniform float u_l3_active, u_l3_opacity,
+    u_l3_exp, u_l3_cont, u_l3_hl, u_l3_sh, u_l3_wh, u_l3_bl,
+    u_l3_temp, u_l3_tint, u_l3_sat, u_l3_vib;
+
   // ── RGB ↔ HSL ─────────────────────────────────────────────────────────────
   vec3 rgb2hsl(vec3 c) {
     float maxC = max(c.r, max(c.g, c.b));
@@ -118,6 +150,29 @@ const FS = /* glsl */ `
   float adjustSat(float s, float f) {
     return f > 0.0 ? clamp(s + f * (1.0 - s), 0.0, 1.0)
                    : clamp(s + f * s,           0.0, 1.0);
+  }
+
+  // ── Local adjustment helper (basic params, no HSL/LGG/clarity) ─────────
+  vec3 applyLocalAdj(vec3 rgb,
+      float exp, float cont, float hl, float sh, float wh, float bl,
+      float temp, float tint, float sat, float vib) {
+    rgb *= pow(2.0, exp);
+    rgb = clamp(rgb, 0.0, 1.0);
+    float cf = cont / 100.0;
+    rgb = clamp((rgb - 0.5) * (1.0 + cf) + 0.5, 0.0, 1.0);
+    float lm = dot(rgb, vec3(0.299, 0.587, 0.114));
+    if (abs(hl) > 0.01) { float m = smoothstep(0.4, 0.85, lm); rgb = mix(rgb, hl > 0.0 ? vec3(1.0) : vec3(0.0), abs(hl)/100.0*m); }
+    if (abs(sh) > 0.01) { float m = 1.0-smoothstep(0.15, 0.6, lm); rgb = mix(rgb, sh > 0.0 ? vec3(1.0) : vec3(0.0), abs(sh)/100.0*m); }
+    if (abs(wh) > 0.01) { float m = smoothstep(0.6, 1.0, lm); rgb = mix(rgb, wh > 0.0 ? vec3(1.0) : vec3(0.0), abs(wh)/100.0*m); }
+    if (abs(bl) > 0.01) { float m = 1.0-smoothstep(0.0, 0.35, lm); rgb = mix(rgb, bl > 0.0 ? vec3(1.0) : vec3(0.0), abs(bl)/100.0*m); }
+    float tF = clamp((temp - 5500.0) / 5000.0, -1.0, 1.0);
+    rgb.r = clamp(rgb.r - tF*0.2, 0.0, 1.0);
+    rgb.b = clamp(rgb.b + tF*0.2, 0.0, 1.0);
+    rgb.g = clamp(rgb.g - tF*0.04, 0.0, 1.0);
+    if (abs(tint) > 0.1) { rgb.g = clamp(rgb.g - (tint/150.0)*0.12, 0.0, 1.0); }
+    if (abs(sat) > 0.01) { vec3 h=rgb2hsl(rgb); h.y=adjustSat(h.y,sat/100.0); rgb=hsl2rgb(h); }
+    if (abs(vib) > 0.01) { vec3 h=rgb2hsl(rgb); float w=1.0-h.y*0.7; h.y=adjustSat(h.y,(vib/100.0)*w); rgb=hsl2rgb(h); }
+    return clamp(rgb, 0.0, 1.0);
   }
 
   // ── Wheel hue/sat/lum → RGB offset (spec section 2.3) ───────────────────
@@ -344,6 +399,25 @@ const FS = /* glsl */ `
       rgb = vec3(r2, g2, b2);
     }
 
+    // ── 17. Local adjustment layers (Phase 3 PRD Section 4.5) ────────────────
+    // Applied after tone curve; mask UV = image UV (same coordinate system).
+    if (u_l0_active > 0.5) {
+      float mv = texture2D(u_mask0, uv).r * u_l0_opacity;
+      if (mv > 0.001) { rgb = mix(rgb, applyLocalAdj(rgb,u_l0_exp,u_l0_cont,u_l0_hl,u_l0_sh,u_l0_wh,u_l0_bl,u_l0_temp,u_l0_tint,u_l0_sat,u_l0_vib), mv); }
+    }
+    if (u_l1_active > 0.5) {
+      float mv = texture2D(u_mask1, uv).r * u_l1_opacity;
+      if (mv > 0.001) { rgb = mix(rgb, applyLocalAdj(rgb,u_l1_exp,u_l1_cont,u_l1_hl,u_l1_sh,u_l1_wh,u_l1_bl,u_l1_temp,u_l1_tint,u_l1_sat,u_l1_vib), mv); }
+    }
+    if (u_l2_active > 0.5) {
+      float mv = texture2D(u_mask2, uv).r * u_l2_opacity;
+      if (mv > 0.001) { rgb = mix(rgb, applyLocalAdj(rgb,u_l2_exp,u_l2_cont,u_l2_hl,u_l2_sh,u_l2_wh,u_l2_bl,u_l2_temp,u_l2_tint,u_l2_sat,u_l2_vib), mv); }
+    }
+    if (u_l3_active > 0.5) {
+      float mv = texture2D(u_mask3, uv).r * u_l3_opacity;
+      if (mv > 0.001) { rgb = mix(rgb, applyLocalAdj(rgb,u_l3_exp,u_l3_cont,u_l3_hl,u_l3_sh,u_l3_wh,u_l3_bl,u_l3_temp,u_l3_tint,u_l3_sat,u_l3_vib), mv); }
+    }
+
     gl_FragColor = vec4(clamp(rgb, 0.0, 1.0), 1.0);
   }
 `;
@@ -383,6 +457,7 @@ function wheelVec3(w: WheelState): [number, number, number] {
 export class WebGLRenderer {
   private readonly gl: WebGLRenderingContext;
   private readonly programInfo: twgl.ProgramInfo;
+  private readonly passthroughProgramInfo: twgl.ProgramInfo;
   private readonly bufferInfo: twgl.BufferInfo;
 
   private texture: WebGLTexture | null = null;
@@ -394,6 +469,11 @@ export class WebGLRenderer {
   private curveLutTexture: WebGLTexture | null = null;
   private lastCurveState: CurveState | null = null;
 
+  /** Local adjustment layer mask textures (up to 4 slots). */
+  private maskTextures: (WebGLTexture | null)[] = [null, null, null, null];
+  /** Fallback 1×1 black texture used for inactive mask slots. */
+  private emptyMaskTexture!: WebGLTexture;
+
   /** Latest-pending state for RAF batching. */
   private pendingAdj: AdjustmentState | null = null;
   private pendingHsl: HslAdjustments = defaultHslAdjustments;
@@ -401,6 +481,8 @@ export class WebGLRenderer {
   private pendingCurves: CurveState = defaultCurveState;
   private pendingHighlightRecovery = 0;
   private pendingShadowRecovery = 0;
+  private pendingLocalLayers: RendererLocalLayer[] = [];
+  private pendingOnRendered: (() => void) | null = null;
   private rafId: number | null = null;
 
   constructor(canvas: HTMLCanvasElement) {
@@ -408,12 +490,50 @@ export class WebGLRenderer {
     if (!gl) throw new Error("WebGL not available");
     this.gl = gl;
     this.programInfo = twgl.createProgramInfo(gl, [VS, FS]);
+    this.passthroughProgramInfo = twgl.createProgramInfo(gl, [VS, FS_PT]);
     // Two triangles covering the full clip-space quad
     this.bufferInfo = twgl.createBufferInfoFromArrays(gl, {
       a_position: { data: [-1, -1, 1, -1, -1, 1,  -1, 1, 1, -1, 1, 1], numComponents: 2 },
     });
-    // Pre-create LUT texture with identity mapping so shader always has a valid sampler
     this._initCurveLut();
+    this._initEmptyMaskTexture();
+  }
+
+  private _initEmptyMaskTexture(): void {
+    const gl = this.gl;
+    const tex = gl.createTexture()!;
+    gl.bindTexture(gl.TEXTURE_2D, tex);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.LUMINANCE, 1, 1, 0, gl.LUMINANCE, gl.UNSIGNED_BYTE, new Uint8Array([0]));
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+    this.emptyMaskTexture = tex;
+  }
+
+  /**
+   * Upload (or replace) the grayscale mask for a local adjustment layer slot (0-3).
+   * Pass null maskData to clear the slot (deactivate).
+   */
+  updateMaskLayer(index: number, maskData: Uint8ClampedArray | null, width: number, height: number): void {
+    if (index < 0 || index >= 4) return;
+    const gl = this.gl;
+    if (!maskData) {
+      if (this.maskTextures[index]) {
+        gl.deleteTexture(this.maskTextures[index]);
+        this.maskTextures[index] = null;
+      }
+      return;
+    }
+    if (!this.maskTextures[index]) {
+      this.maskTextures[index] = gl.createTexture();
+    }
+    gl.bindTexture(gl.TEXTURE_2D, this.maskTextures[index]);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.LUMINANCE, width, height, 0, gl.LUMINANCE, gl.UNSIGNED_BYTE, maskData);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
   }
 
   private _initCurveLut(): void {
@@ -476,6 +596,8 @@ export class WebGLRenderer {
   /**
    * Schedule a render for the next animation frame (spec: ≤ 8 ms debounce).
    * Rapid calls within the same frame are batched — only the latest state is used.
+   * `onRendered` fires after the draw completes; if batching skipped an earlier call,
+   * only the winning call's callback fires (latest-wins semantics).
    */
   render(
     adj: AdjustmentState = DEFAULT_ADJ,
@@ -484,6 +606,8 @@ export class WebGLRenderer {
     curveState: CurveState = defaultCurveState,
     highlightRecovery = 0,
     shadowRecovery = 0,
+    localLayers: RendererLocalLayer[] = [],
+    onRendered?: () => void,
   ): void {
     this.pendingAdj = adj;
     this.pendingHsl = hsl;
@@ -491,15 +615,77 @@ export class WebGLRenderer {
     this.pendingCurves = curveState;
     this.pendingHighlightRecovery = highlightRecovery;
     this.pendingShadowRecovery = shadowRecovery;
-    if (this.rafId !== null) return; // already queued
+    this.pendingLocalLayers = localLayers;
+    this.pendingOnRendered = onRendered ?? null; // latest callback wins
+    if (this.rafId !== null) return; // already queued; new state will be used when it fires
     this.rafId = requestAnimationFrame(() => {
       this.rafId = null;
       if (this.pendingAdj) this._draw(
         this.pendingAdj, this.pendingHsl, this.pendingWheels, this.pendingCurves,
-        this.pendingHighlightRecovery, this.pendingShadowRecovery,
+        this.pendingHighlightRecovery, this.pendingShadowRecovery, this.pendingLocalLayers,
       );
       this.pendingAdj = null;
+      const cb = this.pendingOnRendered;
+      this.pendingOnRendered = null;
+      cb?.();
     });
+  }
+
+  /** Cancel any queued RAF render without drawing. */
+  cancelPending(): void {
+    if (this.rafId !== null) {
+      cancelAnimationFrame(this.rafId);
+      this.rafId = null;
+      this.pendingAdj = null;
+      this.pendingOnRendered = null;
+    }
+  }
+
+  /**
+   * Blit previously captured pixel data back to the canvas via a minimal
+   * pass-through shader, bypassing the entire adjustment pipeline.
+   * Called on render-cache hits (PRD Section 5.4).
+   */
+  renderFromCache(pixels: Uint8Array, srcWidth: number, srcHeight: number): void {
+    const gl = this.gl;
+    const canvas = gl.canvas as HTMLCanvasElement;
+    const cw = canvas.width, ch = canvas.height;
+    if (!cw || !ch) return;
+
+    gl.viewport(0, 0, cw, ch);
+
+    const tex = gl.createTexture()!;
+    gl.bindTexture(gl.TEXTURE_2D, tex);
+    gl.texImage2D(
+      gl.TEXTURE_2D, 0, gl.RGBA, srcWidth, srcHeight, 0,
+      gl.RGBA, gl.UNSIGNED_BYTE, pixels,
+    );
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+
+    gl.useProgram(this.passthroughProgramInfo.program);
+    twgl.setBuffersAndAttributes(gl, this.passthroughProgramInfo, this.bufferInfo);
+    twgl.setUniforms(this.passthroughProgramInfo, { u_cache: tex });
+    twgl.drawBufferInfo(gl, this.bufferInfo);
+
+    gl.deleteTexture(tex);
+  }
+
+  /**
+   * Synchronously read back the current framebuffer pixels.
+   * Called immediately after drawSync() / _draw() to populate the render cache.
+   * Returns null if the canvas has no valid dimensions.
+   */
+  capturePixels(): { data: Uint8Array; width: number; height: number } | null {
+    const gl = this.gl;
+    const canvas = gl.canvas as HTMLCanvasElement;
+    const w = canvas.width, h = canvas.height;
+    if (!w || !h) return null;
+    const data = new Uint8Array(w * h * 4);
+    gl.readPixels(0, 0, w, h, gl.RGBA, gl.UNSIGNED_BYTE, data);
+    return { data, width: w, height: h };
   }
 
   /** Synchronous draw — use only when you need the result immediately (e.g., export). */
@@ -510,17 +696,19 @@ export class WebGLRenderer {
     curveState: CurveState = defaultCurveState,
     highlightRecovery = 0,
     shadowRecovery = 0,
+    localLayers: RendererLocalLayer[] = [],
   ): void {
     if (this.rafId !== null) {
       cancelAnimationFrame(this.rafId);
       this.rafId = null;
     }
-    this._draw(adj, hsl, colorWheels, curveState, highlightRecovery, shadowRecovery);
+    this._draw(adj, hsl, colorWheels, curveState, highlightRecovery, shadowRecovery, localLayers);
   }
 
   private _draw(
     adj: AdjustmentState, hsl: HslAdjustments, colorWheels: ColorWheelState,
     curveState: CurveState, highlightRecovery = 0, shadowRecovery = 0,
+    localLayers: RendererLocalLayer[] = [],
   ): void {
     const gl = this.gl;
     if (!this.texture) return;
@@ -538,6 +726,28 @@ export class WebGLRenderer {
 
     gl.useProgram(this.programInfo.program);
     twgl.setBuffersAndAttributes(gl, this.programInfo, this.bufferInfo);
+    // Build local layer uniform block
+    const llUniforms: Record<string, unknown> = {};
+    for (let i = 0; i < 4; i++) {
+      const ll = localLayers[i];
+      const p = `u_l${i}`;
+      const maskTex = this.maskTextures[i] ?? this.emptyMaskTexture;
+      const adj2 = ll?.adjustments ?? DEFAULT_ADJ;
+      llUniforms[`u_mask${i}`]   = maskTex;
+      llUniforms[`${p}_active`]  = (ll && ll.opacity > 0 && this.maskTextures[i]) ? 1 : 0;
+      llUniforms[`${p}_opacity`] = ll?.opacity ?? 0;
+      llUniforms[`${p}_exp`]     = adj2.exposure;
+      llUniforms[`${p}_cont`]    = adj2.contrast;
+      llUniforms[`${p}_hl`]      = adj2.highlights;
+      llUniforms[`${p}_sh`]      = adj2.shadows;
+      llUniforms[`${p}_wh`]      = adj2.whites;
+      llUniforms[`${p}_bl`]      = adj2.blacks;
+      llUniforms[`${p}_temp`]    = adj2.temperature;
+      llUniforms[`${p}_tint`]    = adj2.tint;
+      llUniforms[`${p}_sat`]     = adj2.saturation;
+      llUniforms[`${p}_vib`]     = adj2.vibrance;
+    }
+
     twgl.setUniforms(this.programInfo, {
       u_image:        this.texture,
       u_curve_lut:    this.curveLutTexture,
@@ -562,6 +772,7 @@ export class WebGLRenderer {
       u_offset_wheel:        wheelVec3(colorWheels.offset),
       u_highlight_recovery:  highlightRecovery / 100,
       u_shadow_recovery:     shadowRecovery / 100,
+      ...llUniforms,
     });
     twgl.drawBufferInfo(gl, this.bufferInfo);
   }
@@ -571,6 +782,11 @@ export class WebGLRenderer {
     if (this.rafId !== null) { cancelAnimationFrame(this.rafId); this.rafId = null; }
     if (this.texture) { this.gl.deleteTexture(this.texture); this.texture = null; }
     if (this.curveLutTexture) { this.gl.deleteTexture(this.curveLutTexture); this.curveLutTexture = null; }
+    if (this.emptyMaskTexture) { this.gl.deleteTexture(this.emptyMaskTexture); }
+    for (let i = 0; i < 4; i++) {
+      if (this.maskTextures[i]) { this.gl.deleteTexture(this.maskTextures[i]); this.maskTextures[i] = null; }
+    }
+    this.gl.deleteProgram(this.passthroughProgramInfo.program);
   }
 }
 
@@ -580,4 +796,20 @@ export function webglSupported(): boolean {
     const c = document.createElement("canvas");
     return !!c.getContext("webgl");
   } catch { return false; }
+}
+
+/**
+ * PRD §5.5 acceptance criterion: detects WebGPU availability and emits a
+ * console warning so developers know ChromaAI is using WebGL instead.
+ * No error is thrown and no UI is affected — the fallback to WebGL is silent.
+ * Call once on workspace mount.
+ */
+export function detectWebGPU(): void {
+  if (typeof navigator !== "undefined" && "gpu" in navigator) {
+    console.warn(
+      "[ChromaAI] WebGPU is available in this browser but ChromaAI currently " +
+      "uses WebGL 1 for all rendering. WebGPU acceleration (PRD §5.1, ~6× faster " +
+      "for 24MP images) is planned for a future release. No action needed."
+    );
+  }
 }

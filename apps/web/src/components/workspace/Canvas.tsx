@@ -12,8 +12,10 @@ import { clsx } from "clsx";
 import { useWorkspace } from "@/context/WorkspaceContext";
 import { ACCEPTED_EXTENSIONS } from "@/lib/imageImport";
 import { WebGLRenderer, webglSupported } from "@/lib/webglRenderer";
+import type { RendererLocalLayer } from "@/lib/webglRenderer";
 import { buildCurveLUT, parametricToPoints } from "@/lib/curveMath";
-import type { AdjustmentState, ColorWheelState, CurveChannel, CurveState, HslAdjustments, ToneCurve, ViewMode } from "@/types";
+import { pngToMask, paintBrush, maskToPng, getMaskResolution } from "@/lib/maskUtils";
+import type { AdjustmentState, ColorWheelState, CurveChannel, CurveState, HslAdjustments, LocalAdjustmentLayer, ToneCurve, ViewMode } from "@/types";
 import { defaultColorWheelState, defaultCurveState } from "@/types";
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
@@ -98,6 +100,25 @@ function ViewLabel({ text, position }: { text: string; position: "left" | "right
   );
 }
 
+// ─── Render cache helpers (PRD Section 5.4) ──────────────────────────────────
+
+/** Maximum number of rendered frames cached per active image. */
+const RENDER_CACHE_MAX = 10;
+
+/** Stable fingerprint for a complete render state used as the LRU cache key. */
+function buildFingerprint(
+  adj: AdjustmentState,
+  hsl: HslAdjustments,
+  wheels: ColorWheelState,
+  curves: CurveState,
+  hr: number,
+  sr: number,
+  ll: RendererLocalLayer[],
+  maskLens: (number | null)[],
+): string {
+  return JSON.stringify({ adj, hsl, wheels, curves, hr, sr, ll, masks: maskLens });
+}
+
 // ─── WebGL canvas hook ────────────────────────────────────────────────────────
 
 /**
@@ -107,19 +128,26 @@ function ViewLabel({ text, position }: { text: string; position: "left" | "right
  * - Reloads the texture whenever `imageSrc` changes.
  * - Schedules RAF-batched renders whenever `adjustments` change (spec: ≤ 8 ms debounce).
  * - Resizes the canvas backing-store via ResizeObserver so gl.viewport stays accurate.
+ * - For images > 4 MP: renders at 25% resolution immediately on slider change, then
+ *   at full resolution after 200 ms of inactivity (PRD Section 5.3 progressive rendering).
  */
 function useWebGLCanvas(
   canvasRef: React.RefObject<HTMLCanvasElement | null>,
   imageSrc: string | null,
+  imageMpx: number,
   adjustments: AdjustmentState,
   hsl: HslAdjustments,
   colorWheels: ColorWheelState,
   curveState: CurveState,
   highlightRecovery: number,
   shadowRecovery: number,
-): { isReady: boolean } {
+  localLayers: LocalAdjustmentLayer[],
+): { isReady: boolean; rendererRef: React.RefObject<WebGLRenderer | null> } {
   const rendererRef = useRef<WebGLRenderer | null>(null);
   const [isReady, setIsReady] = useState(false);
+  const progressiveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const imageMpxRef = useRef(imageMpx);
+  imageMpxRef.current = imageMpx;
   const adjRef = useRef(adjustments);
   adjRef.current = adjustments;
   const hslRef = useRef(hsl);
@@ -132,26 +160,83 @@ function useWebGLCanvas(
   hrRef.current = highlightRecovery;
   const srRef = useRef(shadowRecovery);
   srRef.current = shadowRecovery;
+  const layersRef = useRef(localLayers);
+  layersRef.current = localLayers;
 
-  // Destroy renderer on unmount only
+  // Track which mask PNG was last uploaded per layer slot to avoid redundant uploads
+  const uploadedMaskPngs = useRef<(string | null)[]>([null, null, null, null]);
+
+  // ── Render cache (PRD Section 5.4) ────────────────────────────────────────
+  // Stores up to RENDER_CACHE_MAX full-resolution framebuffer snapshots keyed
+  // by adjustment fingerprint.  Cache hits bypass the full shader pipeline.
+  type CacheEntry = { data: Uint8Array; width: number; height: number };
+  const renderCache = useRef<Map<string, CacheEntry>>(new Map());
+  const cacheKeys   = useRef<string[]>([]);
+
+  const lruGet = (key: string): CacheEntry | null => {
+    const entry = renderCache.current.get(key);
+    if (!entry) return null;
+    // Promote to most-recently-used
+    const idx = cacheKeys.current.indexOf(key);
+    if (idx !== -1) cacheKeys.current.splice(idx, 1);
+    cacheKeys.current.push(key);
+    return entry;
+  };
+
+  const lruSet = (key: string, entry: CacheEntry): void => {
+    if (renderCache.current.has(key)) {
+      renderCache.current.set(key, entry);
+      const idx = cacheKeys.current.indexOf(key);
+      if (idx !== -1) cacheKeys.current.splice(idx, 1);
+    } else {
+      if (cacheKeys.current.length >= RENDER_CACHE_MAX) {
+        const oldest = cacheKeys.current.shift()!;
+        renderCache.current.delete(oldest);
+      }
+      renderCache.current.set(key, entry);
+    }
+    cacheKeys.current.push(key);
+  };
+
+  const _maskLens = (): (number | null)[] =>
+    uploadedMaskPngs.current.map((m) => (m !== null ? m.length : null));
+
+  const _buildLayerUniforms = (): RendererLocalLayer[] =>
+    layersRef.current
+      .filter((l) => l.visible && l.mask?.maskPng && !l.mask.isLoading)
+      .slice(0, 4)
+      .map((l) => ({ opacity: l.opacity, adjustments: l.adjustments }));
+
+  // Destroy renderer on unmount only; clear any pending progressive timer
   useEffect(() => {
     return () => {
+      if (progressiveTimerRef.current !== null) {
+        clearTimeout(progressiveTimerRef.current);
+        progressiveTimerRef.current = null;
+      }
       rendererRef.current?.destroy();
       rendererRef.current = null;
     };
   }, []);
 
-  // Keep canvas backing-store in sync with its CSS display size (spec Section 3.3)
-  // CSS transforms don't affect offsetWidth/Height, so this stays at container resolution.
+  // Keep canvas backing-store in sync with its CSS display size (spec Section 3.3).
+  // Skip sync during active progressive-render cycles to avoid undoing the 25% downscale.
   useEffect(() => {
     const canvas = canvasRef.current;
     if (!canvas) return;
     const obs = new ResizeObserver(() => {
       const { offsetWidth: w, offsetHeight: h } = canvas;
-      if (w && h && (canvas.width !== w || canvas.height !== h)) {
+      if (!w || !h) return;
+      // During progressive rendering the canvas is intentionally smaller than its CSS
+      // size. Only sync when there's no pending full-res timer.
+      if (progressiveTimerRef.current !== null) return;
+      if (canvas.width !== w || canvas.height !== h) {
         canvas.width = w;
         canvas.height = h;
-        if (isReady) rendererRef.current?.render(adjRef.current, hslRef.current, wheelsRef.current, curvesRef.current, hrRef.current, srRef.current);
+        if (isReady) rendererRef.current?.render(
+          adjRef.current, hslRef.current, wheelsRef.current, curvesRef.current,
+          hrRef.current, srRef.current, _buildLayerUniforms(),
+        );
       }
     });
     obs.observe(canvas);
@@ -159,11 +244,6 @@ function useWebGLCanvas(
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [isReady]);
 
-  // Load image texture.
-  // The renderer is lazy-initialised here rather than at mount because the
-  // <canvas> element lives inside the activeImage conditional branch — its ref
-  // is null at mount time (no image yet).  By the time imageSrc becomes
-  // non-null the canvas is already in the DOM, so canvasRef.current is valid.
   useEffect(() => {
     if (!imageSrc) { setIsReady(false); return; }
 
@@ -180,19 +260,150 @@ function useWebGLCanvas(
     }
 
     setIsReady(false);
+    // Clear all per-image state when image changes
+    uploadedMaskPngs.current = [null, null, null, null];
+    renderCache.current.clear();
+    cacheKeys.current = [];
+    if (progressiveTimerRef.current !== null) {
+      clearTimeout(progressiveTimerRef.current);
+      progressiveTimerRef.current = null;
+    }
     rendererRef.current.loadImage(imageSrc)
       .then(() => setIsReady(true))
       .catch(console.error);
   }, [imageSrc]);
 
-  // Re-render when adjustments, HSL, wheels, curves, or RAW recovery change
+  // Upload changed mask textures and re-render
+  useEffect(() => {
+    if (!isReady || !rendererRef.current) return;
+
+    const renderer = rendererRef.current;
+    const visibleLayers = localLayers
+      .filter((l) => l.visible && l.mask?.maskPng && !l.mask.isLoading)
+      .slice(0, 4);
+
+    // Upload any mask textures that changed
+    visibleLayers.forEach((layer, i) => {
+      const png = layer.mask!.maskPng!;
+      if (uploadedMaskPngs.current[i] === png) return;
+      uploadedMaskPngs.current[i] = png;
+      const { maskWidth: w, maskHeight: h } = layer.mask!;
+      pngToMask(png, w, h).then((data) => {
+        renderer.updateMaskLayer(i, data, w, h);
+        renderer.render(
+          adjRef.current, hslRef.current, wheelsRef.current, curvesRef.current,
+          hrRef.current, srRef.current, _buildLayerUniforms(),
+        );
+      }).catch(console.error);
+    });
+
+    // Clear slots for layers that disappeared
+    for (let i = visibleLayers.length; i < 4; i++) {
+      if (uploadedMaskPngs.current[i] !== null) {
+        uploadedMaskPngs.current[i] = null;
+        renderer.updateMaskLayer(i, null, 1, 1);
+      }
+    }
+
+    renderer.render(
+      adjRef.current, hslRef.current, wheelsRef.current, curvesRef.current,
+      hrRef.current, srRef.current, _buildLayerUniforms(),
+    );
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [localLayers, isReady]);
+
+  // Re-render when global adjustments change.
+  //
+  // Large images (> 4 MP) — PRD Section 5.3 progressive rendering:
+  //   Pass 1 (immediate): render at 25% resolution for instant slider feedback.
+  //   Pass 2 (deferred):  200 ms after the last change, render full-res.
+  //     → Check render cache first (PRD Section 5.4): if this exact state was
+  //       rendered before, blit the cached pixels via the pass-through shader
+  //       instead of running the full pipeline.
+  //
+  // Small images (≤ 4 MP) — always render at full resolution, also cache-aware:
+  //   Cache hit  → renderFromCache() immediately (no RAF, no GPU pipeline).
+  //   Cache miss → render() via RAF; capture pixels in the onRendered callback.
   useEffect(() => {
     if (!isReady) return;
-    rendererRef.current?.render(adjustments, hsl, colorWheels, curveState, highlightRecovery, shadowRecovery);
+    const renderer = rendererRef.current;
+    const canvas = canvasRef.current;
+    if (!renderer || !canvas) return;
+
+    const ll  = _buildLayerUniforms();
+    const mls = _maskLens();
+    const key = buildFingerprint(adjustments, hsl, colorWheels, curveState,
+      highlightRecovery, shadowRecovery, ll, mls);
+
+    if (imageMpxRef.current > 4_000_000) {
+      // ── Large image: progressive + cache ───────────────────────────────────
+      if (progressiveTimerRef.current !== null) clearTimeout(progressiveTimerRef.current);
+
+      // Pass 1 — 25% preview (no cache — ephemeral)
+      const fullW = canvas.offsetWidth;
+      const fullH = canvas.offsetHeight;
+      if (fullW && fullH) {
+        canvas.width  = Math.max(1, Math.round(fullW / 2));
+        canvas.height = Math.max(1, Math.round(fullH / 2));
+      }
+      renderer.render(adjustments, hsl, colorWheels, curveState, highlightRecovery, shadowRecovery, ll);
+
+      // Pass 2 — full-res after 200 ms idle, cache-aware
+      progressiveTimerRef.current = setTimeout(() => {
+        progressiveTimerRef.current = null;
+        const c = canvasRef.current;
+        const r = rendererRef.current;
+        if (!c || !r) return;
+        const w = c.offsetWidth, h = c.offsetHeight;
+        if (w && h) { c.width = w; c.height = h; }
+
+        // Build the key from the LATEST refs so it reflects any interim changes
+        const latestLl  = _buildLayerUniforms();
+        const latestMls = _maskLens();
+        const latestKey = buildFingerprint(
+          adjRef.current, hslRef.current, wheelsRef.current, curvesRef.current,
+          hrRef.current, srRef.current, latestLl, latestMls,
+        );
+
+        const cached = lruGet(latestKey);
+        if (cached && cached.width === w && cached.height === h) {
+          // Cache hit — blit stored pixels, skip the full shader pipeline
+          r.cancelPending();
+          r.renderFromCache(cached.data, cached.width, cached.height);
+        } else {
+          // Cache miss — full synchronous render then capture
+          r.cancelPending();
+          r.drawSync(
+            adjRef.current, hslRef.current, wheelsRef.current, curvesRef.current,
+            hrRef.current, srRef.current, latestLl,
+          );
+          const captured = r.capturePixels();
+          if (captured) lruSet(latestKey, captured);
+        }
+      }, 200);
+    } else {
+      // ── Small image: full-res, cache-aware ─────────────────────────────────
+      const w = canvas.offsetWidth, h = canvas.offsetHeight;
+      const cached = lruGet(key);
+      if (cached && cached.width === w && cached.height === h) {
+        // Cache hit — instant blit, no GPU pipeline
+        renderer.cancelPending();
+        renderer.renderFromCache(cached.data, cached.width, cached.height);
+      } else {
+        // Cache miss — RAF render; capture result for future hits
+        renderer.render(
+          adjustments, hsl, colorWheels, curveState, highlightRecovery, shadowRecovery, ll,
+          () => {
+            const captured = rendererRef.current?.capturePixels();
+            if (captured) lruSet(key, captured);
+          },
+        );
+      }
+    }
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [adjustments, hsl, colorWheels, curveState, highlightRecovery, shadowRecovery, isReady]);
 
-  return { isReady };
+  return { isReady, rendererRef };
 }
 
 // ─── Canvas component ─────────────────────────────────────────────────────────
@@ -203,10 +414,12 @@ export function Canvas() {
     adjustments, effectiveAdjustments, hsl, colorWheels, curveState, importImages,
     tatActive, setTatActive, setTatLuminance, setCurve,
     highlightRecovery, shadowRecovery,
+    localLayers, activeBrushLayerId, brushSize, brushHardness, commitBrushMask,
   } = useWorkspace();
-  const fileInputRef = useRef<HTMLInputElement>(null);
-  const containerRef = useRef<HTMLDivElement>(null);
-  const glCanvasRef  = useRef<HTMLCanvasElement>(null);
+  const fileInputRef   = useRef<HTMLInputElement>(null);
+  const containerRef   = useRef<HTMLDivElement>(null);
+  const glCanvasRef    = useRef<HTMLCanvasElement>(null);
+  const brushCanvasRef = useRef<HTMLCanvasElement>(null);
 
   // TAT drag tracking
   const tatDragRef = useRef<{
@@ -234,17 +447,125 @@ export function Canvas() {
 
   const activeImage = images.find((i) => i.id === activeImageId) ?? null;
 
-  // WebGL renderer — renders effectiveAdjustments + HSL + color wheels + tone curve + RAW recovery
-  const { isReady } = useWebGLCanvas(
+  // WebGL renderer — renders effectiveAdjustments + HSL + color wheels + tone curve + local layers
+  const { isReady, rendererRef } = useWebGLCanvas(
     glCanvasRef,
     activeImage?.originalDataUrl ?? null,
+    (activeImage?.width ?? 0) * (activeImage?.height ?? 0),
     effectiveAdjustments,
     hsl,
     colorWheels,
     curveState,
     highlightRecovery,
     shadowRecovery,
+    localLayers,
   );
+
+  // ── Brush tool ─────────────────────────────────────────────────────────────
+
+  // Live mask data for the active brush layer (decoded once, painted in-memory)
+  const brushMaskDataRef = useRef<Uint8ClampedArray | null>(null);
+  const brushMaskDirtyRef = useRef(false);
+  const brushLastPosRef = useRef<{ x: number; y: number } | null>(null);
+  const brushIsDown = useRef(false);
+
+  const activeBrushLayer = activeBrushLayerId
+    ? localLayers.find((l) => l.id === activeBrushLayerId) ?? null
+    : null;
+
+  // Load brush mask data whenever the active brush layer changes
+  useEffect(() => {
+    brushMaskDataRef.current = null;
+    brushMaskDirtyRef.current = false;
+    if (!activeBrushLayer?.mask?.maskPng || !activeImage) return;
+    const { maskWidth: w, maskHeight: h } = activeBrushLayer.mask;
+    pngToMask(activeBrushLayer.mask.maskPng, w, h)
+      .then((data) => { brushMaskDataRef.current = new Uint8ClampedArray(data); })
+      .catch(console.error);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeBrushLayerId, activeImage?.id]);
+
+  /** Convert a screen-space point (relative to container) to mask-space. */
+  const screenToMask = useCallback((sx: number, sy: number): { x: number; y: number } | null => {
+    if (!containerSize.w || !containerSize.h || !activeImage || !activeBrushLayer?.mask) return null;
+    const fit = containFit(containerSize.w, containerSize.h, activeImage.width, activeImage.height);
+    // Invert zoom/pan: screen → container-local
+    const cx = containerSize.w / 2, cy = containerSize.h / 2;
+    const lx = cx + (sx - cx - pan.x) / zoom;
+    const ly = cy + (sy - cy - pan.y) / zoom;
+    // Container-local → image fraction → mask pixels
+    const fx = (lx - fit.left) / fit.width;
+    const fy = (ly - fit.top) / fit.height;
+    const { maskWidth: mw, maskHeight: mh } = activeBrushLayer.mask;
+    return { x: fx * mw, y: fy * mh };
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [containerSize, activeImage, activeBrushLayer, pan, zoom]);
+
+  /** Paint a stroke at the given screen point and refresh the WebGL mask texture. */
+  const doBrushStroke = useCallback((sx: number, sy: number, erase: boolean) => {
+    if (!brushMaskDataRef.current || !activeBrushLayer?.mask) return;
+    const pos = screenToMask(sx, sy);
+    if (!pos) return;
+    const { maskWidth: mw, maskHeight: mh } = activeBrushLayer.mask;
+
+    // Interpolate with last position for smooth strokes
+    const last = brushLastPosRef.current;
+    if (last) {
+      const steps = Math.ceil(Math.hypot(pos.x - last.x, pos.y - last.y) / (brushSize * 0.3));
+      for (let i = 1; i <= steps; i++) {
+        const t = i / steps;
+        paintBrush(brushMaskDataRef.current, mw, mh,
+          last.x + (pos.x - last.x) * t, last.y + (pos.y - last.y) * t,
+          brushSize, brushHardness, erase);
+      }
+    } else {
+      paintBrush(brushMaskDataRef.current, mw, mh, pos.x, pos.y, brushSize, brushHardness, erase);
+    }
+    brushLastPosRef.current = pos;
+    brushMaskDirtyRef.current = true;
+
+    // Upload updated mask texture directly to renderer for 60fps feedback
+    if (rendererRef.current) {
+      rendererRef.current.updateMaskLayer(
+        localLayers.filter((l) => l.visible && l.mask?.maskPng && !l.mask.isLoading).slice(0, 4)
+          .findIndex((l) => l.id === activeBrushLayerId),
+        brushMaskDataRef.current, mw, mh,
+      );
+      rendererRef.current.render(
+        effectiveAdjustments, hsl, colorWheels, curveState, highlightRecovery, shadowRecovery,
+        localLayers.filter((l) => l.visible && l.mask?.maskPng && !l.mask.isLoading).slice(0, 4)
+          .map((l) => ({ opacity: l.opacity, adjustments: l.adjustments })),
+      );
+    }
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeBrushLayer, brushSize, brushHardness, screenToMask, rendererRef,
+      activeBrushLayerId, localLayers, effectiveAdjustments, hsl, colorWheels, curveState, highlightRecovery, shadowRecovery]);
+
+  const handleBrushPointerDown = useCallback((e: React.PointerEvent) => {
+    if (!activeBrushLayerId || e.button !== 0) return;
+    e.preventDefault();
+    (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
+    brushIsDown.current = true;
+    brushLastPosRef.current = null;
+    const rect = containerRef.current!.getBoundingClientRect();
+    doBrushStroke(e.clientX - rect.left, e.clientY - rect.top, e.altKey);
+  }, [activeBrushLayerId, doBrushStroke]);
+
+  const handleBrushPointerMove = useCallback((e: React.PointerEvent) => {
+    if (!activeBrushLayerId || !brushIsDown.current) return;
+    const rect = containerRef.current!.getBoundingClientRect();
+    doBrushStroke(e.clientX - rect.left, e.clientY - rect.top, e.altKey);
+  }, [activeBrushLayerId, doBrushStroke]);
+
+  const handleBrushPointerUp = useCallback(() => {
+    if (!activeBrushLayerId || !brushMaskDirtyRef.current || !brushMaskDataRef.current || !activeBrushLayer?.mask) return;
+    brushIsDown.current = false;
+    brushLastPosRef.current = null;
+    brushMaskDirtyRef.current = false;
+    const { maskWidth: mw, maskHeight: mh } = activeBrushLayer.mask;
+    const png = maskToPng(brushMaskDataRef.current, mw, mh);
+    commitBrushMask(activeBrushLayerId, png);
+  }, [activeBrushLayerId, activeBrushLayer, commitBrushMask]);
 
   // ── TAT helpers ────────────────────────────────────────────────────────────
 
@@ -535,18 +856,33 @@ export function Canvas() {
              * canvas backing-store remains at container resolution regardless
              * of zoom level (visual scaling is handled by the browser).
              */}
+            {/* Brush painting overlay — outside the zoom/pan transform so coords are in container space */}
+            {activeBrushLayerId && (
+              <div
+                className="absolute inset-0 z-30"
+                style={{ cursor: "none" }}
+                onPointerDown={handleBrushPointerDown}
+                onPointerMove={handleBrushPointerMove}
+                onPointerUp={handleBrushPointerUp}
+              >
+                <div className="absolute top-2 left-1/2 -translate-x-1/2 text-[10px] bg-black/70 text-zinc-300 px-2 py-0.5 rounded pointer-events-none">
+                  Brush · Paint to add · Alt+paint to erase
+                </div>
+              </div>
+            )}
+
             <div
               style={{
                 position: "absolute",
                 inset: 0,
                 transform: `translate(${pan.x}px, ${pan.y}px) scale(${zoom})`,
                 transformOrigin: "50% 50%",
-                cursor: tatActive ? "crosshair" : isPanning ? "grabbing" : "grab",
+                cursor: activeBrushLayerId ? "none" : tatActive ? "crosshair" : isPanning ? "grabbing" : "grab",
               }}
-              onMouseDown={startPan}
-              onPointerDown={handleTatPointerDown}
-              onPointerMove={handleTatPointerMove}
-              onPointerUp={handleTatPointerUp}
+              onMouseDown={activeBrushLayerId ? undefined : startPan}
+              onPointerDown={activeBrushLayerId ? undefined : handleTatPointerDown}
+              onPointerMove={activeBrushLayerId ? undefined : handleTatPointerMove}
+              onPointerUp={activeBrushLayerId ? undefined : handleTatPointerUp}
             >
               {/*
                * WebGL canvas — always mounted so the GL context survives view-mode

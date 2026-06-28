@@ -8,7 +8,7 @@ from fastapi.staticfiles import StaticFiles
 from pathlib import Path
 import logging
 
-from routers import images, grade, prompt, batch, reference, raw
+from routers import images, grade, prompt, batch, reference, raw, masks
 
 logger = logging.getLogger("chromaai")
 
@@ -37,6 +37,7 @@ app.include_router(prompt.router)
 app.include_router(batch.router)
 app.include_router(reference.router)
 app.include_router(raw.router)
+app.include_router(masks.router)
 
 
 @app.exception_handler(Exception)

@@ -77,4 +77,22 @@ export const api = {
         body: JSON.stringify({ data_url: dataUrl }),
       }),
   },
+
+  masks: {
+    subject: (dataUrl: string) =>
+      request<{ mask_png: string; width: number; height: number }>("/masks/subject", {
+        method: "POST",
+        body: JSON.stringify({ data_url: dataUrl }),
+      }),
+    sky: (dataUrl: string) =>
+      request<{ mask_png: string; width: number; height: number }>("/masks/sky", {
+        method: "POST",
+        body: JSON.stringify({ data_url: dataUrl }),
+      }),
+    background: (dataUrl: string) =>
+      request<{ mask_png: string; width: number; height: number }>("/masks/background", {
+        method: "POST",
+        body: JSON.stringify({ data_url: dataUrl }),
+      }),
+  },
 };

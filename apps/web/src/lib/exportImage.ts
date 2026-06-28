@@ -1,6 +1,9 @@
 import JSZip from "jszip";
 import { WebGLRenderer, webglSupported } from "@/lib/webglRenderer";
-import type { AdjustmentState, ColorWheelState, CurveState, HslAdjustments, ImageRecord } from "@/types";
+import type { RendererLocalLayer } from "@/lib/webglRenderer";
+import { pngToMask } from "@/lib/maskUtils";
+import { getExportWorker } from "@/lib/workerBridge";
+import type { AdjustmentState, ColorWheelState, CurveState, HslAdjustments, ImageRecord, LocalAdjustmentLayer } from "@/types";
 import { defaultColorWheelState, defaultCurveState, defaultHslAdjustments } from "@/types";
 
 export type ExportFormat = "image/jpeg" | "image/png" | "image/webp";
@@ -47,6 +50,55 @@ function triggerDownload(blob: Blob, filename: string): void {
 // ─── Core render-to-blob ──────────────────────────────────────────────────────
 
 /**
+ * Renders one image onto an existing renderer+canvas.
+ * Canvas dimensions are resized per image so the caller owns the lifecycle.
+ * Used internally by both single-image and batch export paths.
+ */
+async function _renderOnRenderer(
+  renderer: WebGLRenderer,
+  canvas: HTMLCanvasElement,
+  image: ImageRecord,
+  options: ExportOptions,
+  adjustments: AdjustmentState,
+  hsl: HslAdjustments,
+  colorWheels: ColorWheelState,
+  curveState: CurveState,
+  localLayers: LocalAdjustmentLayer[],
+): Promise<Blob> {
+  const { format, quality, resolution } = options;
+  const { width, height } = resolveResolution(image.width, image.height, resolution);
+  const hr = image.highlightRecovery ?? 0;
+  const sr = image.shadowRecovery ?? 0;
+
+  canvas.width = width;
+  canvas.height = height;
+
+  await renderer.loadImage(image.originalDataUrl);
+
+  const visibleLayers = localLayers
+    .filter((l) => l.visible && l.mask?.maskPng && !l.mask.isLoading)
+    .slice(0, 4);
+  await Promise.all(visibleLayers.map(async (layer, i) => {
+    const { maskWidth: mw, maskHeight: mh } = layer.mask!;
+    const data = await pngToMask(layer.mask!.maskPng!, mw, mh);
+    renderer.updateMaskLayer(i, data, mw, mh);
+  }));
+  const llUniforms: RendererLocalLayer[] = visibleLayers.map((l) => ({
+    opacity: l.opacity,
+    adjustments: l.adjustments,
+  }));
+
+  renderer.drawSync(adjustments, hsl, colorWheels, curveState, hr, sr, llUniforms);
+  return new Promise<Blob>((resolve, reject) => {
+    canvas.toBlob(
+      (b) => (b ? resolve(b) : reject(new Error("toBlob returned null"))),
+      format,
+      format === "image/png" ? undefined : quality
+    );
+  });
+}
+
+/**
  * Renders one image to a Blob using the provided adjustments.
  *
  * `adjustments` is passed explicitly — callers supply effectiveAdjustments
@@ -59,34 +111,22 @@ async function renderToBlob(
   adjustments: AdjustmentState,
   hsl: HslAdjustments = defaultHslAdjustments,
   colorWheels: ColorWheelState = defaultColorWheelState,
-  curveState: CurveState = defaultCurveState
+  curveState: CurveState = defaultCurveState,
+  localLayers: LocalAdjustmentLayer[] = [],
 ): Promise<Blob> {
-  const { format, quality, resolution } = options;
-  const { width, height } = resolveResolution(image.width, image.height, resolution);
-
   if (webglSupported()) {
     const canvas = document.createElement("canvas");
-    canvas.width = width;
-    canvas.height = height;
     const renderer = new WebGLRenderer(canvas);
-    const hr = image.highlightRecovery ?? 0;
-    const sr = image.shadowRecovery ?? 0;
     try {
-      await renderer.loadImage(image.originalDataUrl);
-      renderer.drawSync(adjustments, hsl, colorWheels, curveState, hr, sr);
-      return await new Promise<Blob>((resolve, reject) => {
-        canvas.toBlob(
-          (b) => (b ? resolve(b) : reject(new Error("toBlob returned null"))),
-          format,
-          format === "image/png" ? undefined : quality
-        );
-      });
+      return await _renderOnRenderer(renderer, canvas, image, options, adjustments, hsl, colorWheels, curveState, localLayers);
     } finally {
       renderer.destroy();
     }
   } else {
     // CSS-filter fallback for browsers without WebGL
     const { buildCssFilter } = await import("@/lib/cssFilters");
+    const { format, quality, resolution } = options;
+    const { width, height } = resolveResolution(image.width, image.height, resolution);
     const canvas = document.createElement("canvas");
     canvas.width = width;
     canvas.height = height;
@@ -123,9 +163,10 @@ export async function exportImage(
   adjustments: AdjustmentState,
   hsl: HslAdjustments = defaultHslAdjustments,
   colorWheels: ColorWheelState = defaultColorWheelState,
-  curveState: CurveState = defaultCurveState
+  curveState: CurveState = defaultCurveState,
+  localLayers: LocalAdjustmentLayer[] = [],
 ): Promise<void> {
-  const blob = await renderToBlob(image, options, adjustments, hsl, colorWheels, curveState);
+  const blob = await renderToBlob(image, options, adjustments, hsl, colorWheels, curveState, localLayers);
   triggerDownload(blob, outputFilename(image, options.format));
 }
 
@@ -135,6 +176,10 @@ export async function exportImage(
  * Each image in `images` should already have its effective adjustments set
  * (i.e., `image.adjustments = applyReferencesToAdjustments(base, refs)`).
  * ExportModal pre-patches the array before calling this function.
+ *
+ * PRD §5.5 performance: a single WebGL context is created for the entire batch
+ * (one context creation + N texture uploads) instead of N context creations.
+ * The event loop yields at every `await` so the UI stays responsive throughout.
  */
 export async function batchExportImages(
   images: ImageRecord[],
@@ -142,21 +187,73 @@ export async function batchExportImages(
   onProgress: (done: number, total: number) => void,
   hsl: HslAdjustments = defaultHslAdjustments,
   colorWheels: ColorWheelState = defaultColorWheelState,
-  curveState: CurveState = defaultCurveState
+  curveState: CurveState = defaultCurveState,
+  localLayers: LocalAdjustmentLayer[] = [],
 ): Promise<void> {
-  const zip = new JSZip();
   const total = images.length;
 
-  for (let i = 0; i < images.length; i++) {
-    const image = images[i];
-    const blob = await renderToBlob(image, options, image.adjustments, hsl, colorWheels, curveState);
-    zip.file(outputFilename(image, options.format), blob);
-    onProgress(i + 1, total);
+  // Render all images on the main thread (WebGL requires canvas access).
+  // Reuse a single renderer for the whole batch to avoid N context creations.
+  const entries: { filename: string; arrayBuffer: ArrayBuffer }[] = [];
+
+  if (webglSupported()) {
+    const canvas = document.createElement("canvas");
+    const renderer = new WebGLRenderer(canvas);
+    try {
+      for (let i = 0; i < images.length; i++) {
+        const image = images[i];
+        const blob = await _renderOnRenderer(renderer, canvas, image, options, image.adjustments, hsl, colorWheels, curveState, localLayers);
+        entries.push({ filename: outputFilename(image, options.format), arrayBuffer: await blob.arrayBuffer() });
+        onProgress(i + 1, total);
+      }
+    } finally {
+      renderer.destroy();
+    }
+  } else {
+    // CSS-filter fallback: reuse a single canvas across the batch
+    const { buildCssFilter } = await import("@/lib/cssFilters");
+    const canvas = document.createElement("canvas");
+    const ctx = canvas.getContext("2d");
+    if (!ctx) throw new Error("Could not get 2D canvas context");
+    for (let i = 0; i < images.length; i++) {
+      const image = images[i];
+      const { format, quality, resolution } = options;
+      const { width, height } = resolveResolution(image.width, image.height, resolution);
+      canvas.width = width;
+      canvas.height = height;
+      const img = new Image();
+      await new Promise<void>((resolve, reject) => {
+        img.onload = () => resolve();
+        img.onerror = () => reject(new Error(`Failed to load ${image.filename} for export`));
+        img.src = image.originalDataUrl;
+      });
+      const filterStr = buildCssFilter(image.adjustments);
+      ctx.filter = filterStr !== "none" ? filterStr : "none";
+      ctx.clearRect(0, 0, width, height);
+      ctx.drawImage(img, 0, 0, width, height);
+      const blob = await new Promise<Blob>((resolve, reject) =>
+        canvas.toBlob((b) => b ? resolve(b) : reject(new Error("toBlob returned null")), format, format === "image/png" ? undefined : quality)
+      );
+      entries.push({ filename: outputFilename(image, options.format), arrayBuffer: await blob.arrayBuffer() });
+      onProgress(i + 1, total);
+    }
   }
 
-  // JPEG/PNG/WebP are already compressed — STORE avoids double-compression
-  // and keeps batch of 10×10MB within the 30s spec budget (Section 5.5).
-  const zipBlob = await zip.generateAsync({ type: "blob", compression: "STORE" });
+  // Package ZIP off the main thread via exportWorker (PRD Section 5.2).
+  // Falls back to JSZip on the main thread if the worker is unavailable.
   const timestamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
-  triggerDownload(zipBlob, `chromaai_export_${timestamp}.zip`);
+  const zipFilename = `chromaai_export_${timestamp}.zip`;
+
+  const exportWorker = getExportWorker();
+  if (exportWorker) {
+    // Transfer ArrayBuffers to worker — zero-copy via Transferable
+    const zipBuffer = await exportWorker.packageZip(entries);
+    triggerDownload(new Blob([zipBuffer], { type: "application/zip" }), zipFilename);
+  } else {
+    // Fallback: main-thread ZIP
+    const zip = new JSZip();
+    for (const { filename, arrayBuffer } of entries) zip.file(filename, arrayBuffer);
+    const zipBlob = await zip.generateAsync({ type: "blob", compression: "STORE" });
+    triggerDownload(zipBlob, zipFilename);
+  }
 }
