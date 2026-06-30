@@ -65,6 +65,48 @@ class VisionAnalystTestRequest(BaseModel):
     image_data_url: str
 
 
+# Mirrors ColorProfile in apps/web/src/types/index.ts (referenceExtract.ts output)
+class ColorProfile(BaseModel):
+    averageTemperature: float = Field(..., ge=2000.0, le=50000.0)
+    averageSaturation: float = Field(..., ge=0.0, le=1.0)
+    contrastRatio: float = Field(..., ge=0.0)
+    shadowHue: list[float] = Field(..., min_length=3, max_length=3)
+    midtoneHue: list[float] = Field(..., min_length=3, max_length=3)
+    highlightHue: list[float] = Field(..., min_length=3, max_length=3)
+    exposureBias: float = Field(..., ge=-1.0, le=1.0)
+    toneCurveShape: Literal[
+        "flat", "lifted_blacks", "crushed_blacks", "high_contrast", "low_contrast"
+    ]
+
+
+class DimensionConsensus(BaseModel):
+    value: float
+    agreement_score: float = Field(..., ge=0.0, le=1.0)
+    outlier_image_indices: list[int]
+
+
+class MoodboardConsensus(BaseModel):
+    # Scalar dimensions
+    averageTemperature: DimensionConsensus
+    averageSaturation: DimensionConsensus
+    contrastRatio: DimensionConsensus
+    exposureBias: DimensionConsensus
+    # RGB triplet dimensions — one DimensionConsensus per channel [R, G, B]
+    shadowHue: list[DimensionConsensus]
+    midtoneHue: list[DimensionConsensus]
+    highlightHue: list[DimensionConsensus]
+    # Categorical: plurality vote
+    toneCurveShape: str
+    toneCurveShapeAgreement: float = Field(..., ge=0.0, le=1.0)
+    # Aggregate
+    overall_agreement_score: float = Field(..., ge=0.0, le=1.0)
+    outlier_image_indices: list[int]  # union across all numeric dimensions
+
+
+class SynthesizerTestRequest(BaseModel):
+    profiles: list[ColorProfile] = Field(..., min_length=2)
+
+
 class PromptVariation(BaseModel):
     label: str
     interpretation: str
