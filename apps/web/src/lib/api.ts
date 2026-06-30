@@ -1,6 +1,8 @@
 import type {
   BatchAdaptRequest,
   BatchAdaptResponse,
+  ColorProfile,
+  MoodboardPipelineResult,
   PromptSubmitRequest,
   PromptSubmitResponse,
   SceneAnalysis,
@@ -93,6 +95,14 @@ export const api = {
       request<{ mask_png: string; width: number; height: number }>("/masks/background", {
         method: "POST",
         body: JSON.stringify({ data_url: dataUrl }),
+      }),
+  },
+
+  moodboard: {
+    analyze: (images: string[], profiles: ColorProfile[]) =>
+      request<MoodboardPipelineResult>("/moodboard/analyze", {
+        method: "POST",
+        body: JSON.stringify({ images, profiles }),
       }),
   },
 };

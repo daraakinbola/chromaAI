@@ -119,6 +119,24 @@ class CreativeDirectorTestRequest(BaseModel):
     consensus: MoodboardConsensus
 
 
+class MoodboardAnalyzeRequest(BaseModel):
+    images: list[str] = Field(..., min_length=2, max_length=10)
+    profiles: list[ColorProfile] = Field(..., min_length=2, max_length=10)
+
+
+class MoodboardProcessingTimes(BaseModel):
+    visionAnalyst: float
+    statisticalSynthesizer: float
+    creativeDirector: float
+
+
+class MoodboardPipelineResult(BaseModel):
+    visionAnalysis: list[VisionAnalystOutput]
+    statisticalConsensus: MoodboardConsensus
+    creativeDirection: CreativeDirectorOutput
+    processingTimeMs: MoodboardProcessingTimes
+
+
 class PromptVariation(BaseModel):
     label: str
     interpretation: str

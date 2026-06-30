@@ -20,6 +20,9 @@ import {
   ColorMaskParams,
   Mask,
   MaskType,
+  MoodboardImage,
+  MoodboardPipelineResult,
+  MoodboardStage,
   PromptEntry,
   ReferenceImage,
   SceneAnalysis,
@@ -100,6 +103,11 @@ interface WorkspaceState {
   activeBrushLayerId: string | null;
   brushSize: number;
   brushHardness: number;
+  /** Moodboard pipeline (Phase 4) */
+  moodboardImages: MoodboardImage[];
+  moodboardResult: MoodboardPipelineResult | null;
+  moodboardStage: MoodboardStage;
+  moodboardError: string | null;
 }
 
 interface WorkspaceActions {
@@ -154,6 +162,8 @@ interface WorkspaceActions {
   setBrushSize: (size: number) => void;
   setBrushHardness: (hardness: number) => void;
   sampleColorFromImage: (imageDataUrl: string, x: number, y: number, imageWidth: number, imageHeight: number) => Promise<number>;
+  addMoodboardImage: (file: File) => Promise<void>;
+  removeMoodboardImage: (id: string) => void;
 }
 
 const WorkspaceContext = createContext<(WorkspaceState & WorkspaceActions) | null>(null);
@@ -197,6 +207,13 @@ export function WorkspaceProvider({ children, sessionId }: WorkspaceProviderProp
   const [toasts, setToasts] = useState<ToastItem[]>([]);
   const [batchConsistencyScore, setBatchConsistencyScore] = useState(100);
   const [isApplyingGrade, setIsApplyingGrade] = useState(false);
+
+  const [moodboardImages, setMoodboardImages] = useState<MoodboardImage[]>([]);
+  const [moodboardResult, setMoodboardResult] = useState<MoodboardPipelineResult | null>(null);
+  const [moodboardStage, setMoodboardStage] = useState<MoodboardStage>("idle");
+  const [moodboardError, setMoodboardError] = useState<string | null>(null);
+  const moodboardStageTimersRef = useRef<ReturnType<typeof setTimeout>[]>([]);
+  const moodboardRunIdRef = useRef(0);
 
   const saveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
@@ -901,6 +918,85 @@ export function WorkspaceProvider({ children, sessionId }: WorkspaceProviderProp
 
   const dismissVariations = () => setPendingVariations(null);
 
+  // ── Moodboard pipeline (Phase 4) ─────────────────────────────────────────
+
+  const moodboardImageHash = moodboardImages.map((i) => i.id).join(",");
+
+  useEffect(() => {
+    if (moodboardImages.length < 2) {
+      setMoodboardResult(null);
+      setMoodboardStage("idle");
+      setMoodboardError(null);
+      return;
+    }
+
+    const runId = ++moodboardRunIdRef.current;
+
+    // Clear any pending stage-transition timers from a prior run
+    moodboardStageTimersRef.current.forEach(clearTimeout);
+    moodboardStageTimersRef.current = [];
+
+    setMoodboardError(null);
+    setMoodboardResult(null);
+    setMoodboardStage("vision");
+
+    // Staged loading animation: simulate the three-stage architecture visually
+    // even though the API call is a single round-trip.
+    const t1 = setTimeout(() => setMoodboardStage("synthesizer"), 1800);
+    const t2 = setTimeout(() => setMoodboardStage("creative"), 3200);
+    moodboardStageTimersRef.current = [t1, t2];
+
+    api.moodboard
+      .analyze(
+        moodboardImages.map((i) => i.originalDataUrl),
+        moodboardImages.map((i) => i.colorProfile),
+      )
+      .then((result) => {
+        if (runId !== moodboardRunIdRef.current) return;
+        moodboardStageTimersRef.current.forEach(clearTimeout);
+        setMoodboardResult(result);
+        setMoodboardStage("done");
+      })
+      .catch((err) => {
+        if (runId !== moodboardRunIdRef.current) return;
+        moodboardStageTimersRef.current.forEach(clearTimeout);
+        setMoodboardError(err instanceof Error ? err.message : "Pipeline failed");
+        setMoodboardStage("error");
+      });
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [moodboardImageHash]);
+
+  const addMoodboardImage = async (file: File) => {
+    const { importReference: doImportRef } = await import("@/lib/referenceExtract");
+
+    const [originalDataUrl, ref] = await Promise.all([
+      new Promise<string>((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onload = () => resolve(reader.result as string);
+        reader.onerror = () => reject(new Error("Failed to read file"));
+        reader.readAsDataURL(file);
+      }),
+      doImportRef(file),
+    ]);
+
+    const newImage: MoodboardImage = {
+      id: crypto.randomUUID(),
+      filename: file.name,
+      thumbnailDataUrl: ref.thumbnailDataUrl,
+      originalDataUrl,
+      colorProfile: ref.extractedProfile,
+    };
+
+    setMoodboardImages((prev) => {
+      if (prev.length >= 10) return prev;
+      return [...prev, newImage];
+    });
+  };
+
+  const removeMoodboardImage = (id: string) => {
+    setMoodboardImages((prev) => prev.filter((img) => img.id !== id));
+  };
+
   // ── References ────────────────────────────────────────────────────────────
 
   const importReference = async (file: File) => {
@@ -1022,6 +1118,12 @@ export function WorkspaceProvider({ children, sessionId }: WorkspaceProviderProp
         setBrushSize,
         setBrushHardness,
         sampleColorFromImage,
+        moodboardImages,
+        moodboardResult,
+        moodboardStage,
+        moodboardError,
+        addMoodboardImage,
+        removeMoodboardImage,
       }}
     >
       {children}

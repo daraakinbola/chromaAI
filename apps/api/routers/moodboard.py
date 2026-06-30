@@ -6,6 +6,8 @@ from models.schemas import (
     SynthesizerTestRequest,
     CreativeDirectorOutput,
     CreativeDirectorTestRequest,
+    MoodboardAnalyzeRequest,
+    MoodboardPipelineResult,
 )
 from services import ai_engine
 from services.statistical_synthesizer import compute_moodboard_consensus
@@ -59,3 +61,27 @@ async def test_creative_director(req: CreativeDirectorTestRequest) -> CreativeDi
         raise HTTPException(503, str(exc)) from exc
     except Exception as exc:
         raise HTTPException(500, f"Creative Director error: {exc}") from exc
+
+
+@router.post("/analyze", response_model=MoodboardPipelineResult)
+async def analyze_moodboard(req: MoodboardAnalyzeRequest) -> MoodboardPipelineResult:
+    """
+    Full three-stage moodboard pipeline: Vision Analyst + Statistical Synthesizer
+    (concurrent) → Creative Director (sequential). Returns visionAnalysis,
+    statisticalConsensus, creativeDirection, and processingTimeMs breakdown
+    showing real wall-clock elapsed per stage.
+    """
+    if len(req.images) != len(req.profiles):
+        raise HTTPException(
+            400,
+            f"images ({len(req.images)}) and profiles ({len(req.profiles)}) must be the same length",
+        )
+    for url in req.images:
+        if not url.startswith("data:image/"):
+            raise HTTPException(400, "Each image must be a base64 data URL (data:image/...)")
+    try:
+        return await ai_engine.run_moodboard_pipeline(req.images, req.profiles)
+    except EnvironmentError as exc:
+        raise HTTPException(503, str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(500, f"Moodboard pipeline error: {exc}") from exc

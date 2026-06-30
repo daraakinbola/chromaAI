@@ -325,6 +325,65 @@ export interface LocalAdjustmentLayer {
   visible: boolean;
 }
 
+// ─── Moodboard pipeline (Phase 4) ────────────────────────────────────────────
+
+export interface VisionAnalystOutput {
+  description: string;
+  technicalCharacter: string;
+  styleReferences: string[];
+  confidence: number;
+}
+
+export interface DimensionConsensus {
+  value: number;
+  agreement_score: number;
+  outlier_image_indices: number[];
+}
+
+export interface MoodboardConsensus {
+  averageTemperature: DimensionConsensus;
+  averageSaturation: DimensionConsensus;
+  contrastRatio: DimensionConsensus;
+  exposureBias: DimensionConsensus;
+  shadowHue: [DimensionConsensus, DimensionConsensus, DimensionConsensus];
+  midtoneHue: [DimensionConsensus, DimensionConsensus, DimensionConsensus];
+  highlightHue: [DimensionConsensus, DimensionConsensus, DimensionConsensus];
+  toneCurveShape: string;
+  toneCurveShapeAgreement: number;
+  overall_agreement_score: number;
+  outlier_image_indices: number[];
+}
+
+export interface CreativeDirectorOutput {
+  creativeBrief: string;
+  confidenceAssessment: string;
+  recommendedWeight: number;
+  flaggedTensions: string[];
+}
+
+export interface MoodboardProcessingTimes {
+  visionAnalyst: number;
+  statisticalSynthesizer: number;
+  creativeDirector: number;
+}
+
+export interface MoodboardPipelineResult {
+  visionAnalysis: VisionAnalystOutput[];
+  statisticalConsensus: MoodboardConsensus;
+  creativeDirection: CreativeDirectorOutput;
+  processingTimeMs: MoodboardProcessingTimes;
+}
+
+export interface MoodboardImage {
+  id: string;
+  filename: string;
+  thumbnailDataUrl: string;
+  originalDataUrl: string;
+  colorProfile: ColorProfile;
+}
+
+export type MoodboardStage = "idle" | "vision" | "synthesizer" | "creative" | "done" | "error";
+
 // ─── Session persistence (Section 7 of Phase 2 TechSpec) ─────────────────────
 
 export interface SessionRecord {

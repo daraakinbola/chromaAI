@@ -3,6 +3,7 @@ AI engine — orchestrates Claude for prompt parsing and scene analysis.
 """
 import os
 import json
+import time
 import asyncio
 from anthropic import AsyncAnthropic
 from models.schemas import (
@@ -12,9 +13,12 @@ from models.schemas import (
     PromptSubmitResponse,
     PromptVariation,
     SessionGenre,
+    ColorProfile,
     VisionAnalystOutput,
     MoodboardConsensus,
     CreativeDirectorOutput,
+    MoodboardProcessingTimes,
+    MoodboardPipelineResult,
 )
 
 def _client() -> AsyncAnthropic:
@@ -357,6 +361,45 @@ Respond with exactly this JSON structure:
         confidenceAssessment=data["confidenceAssessment"],
         recommendedWeight=float(data["recommendedWeight"]),
         flaggedTensions=data.get("flaggedTensions", []),
+    )
+
+
+async def run_moodboard_pipeline(
+    images: list[str],
+    profiles: list[ColorProfile],
+) -> MoodboardPipelineResult:
+    """
+    Full three-stage moodboard pipeline (Section 6.3).
+
+    Stage 1 (Vision Analyst) and Stage 2 (Statistical Synthesizer) run concurrently
+    via asyncio.gather — neither depends on the other. Stage 3 (Creative Director)
+    runs only once both are complete. processingTimeMs reflects real wall-clock
+    elapsed per stage, demonstrating the overlapping nature of stages 1 and 2.
+    """
+    from services.statistical_synthesizer import compute_moodboard_consensus
+
+    t0 = time.time()
+
+    vision_task = run_vision_analyst_batch(images)
+    stats_task = asyncio.to_thread(compute_moodboard_consensus, profiles)
+    vision_results, consensus = await asyncio.gather(vision_task, stats_task)
+
+    t1 = time.time()
+
+    creative_direction = await run_creative_director(vision_results, consensus)
+
+    t2 = time.time()
+
+    stage_ms = (t1 - t0) * 1000
+    return MoodboardPipelineResult(
+        visionAnalysis=vision_results,
+        statisticalConsensus=consensus,
+        creativeDirection=creative_direction,
+        processingTimeMs=MoodboardProcessingTimes(
+            visionAnalyst=stage_ms,
+            statisticalSynthesizer=stage_ms,
+            creativeDirector=(t2 - t1) * 1000,
+        ),
     )
 
 

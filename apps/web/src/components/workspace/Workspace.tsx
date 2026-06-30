@@ -5,14 +5,25 @@ import { useSearchParams } from "next/navigation";
 import { ImageBrowser } from "./ImageBrowser";
 import { Canvas } from "./Canvas";
 import { AdjustmentPanel } from "./AdjustmentPanel";
+import { MoodboardPanel } from "./MoodboardPanel";
 import { PromptBar } from "./PromptBar";
 import { ReferenceStrip } from "./ReferenceStrip";
 import { WorkspaceProvider } from "@/context/WorkspaceContext";
 import { ToastStack } from "@/components/ui/Toast";
 import { ExportModal } from "@/components/ui/ExportModal";
-import { Layers, Settings, HelpCircle } from "lucide-react";
+import { Layers, Settings, HelpCircle, Palette } from "lucide-react";
 
-function Header({ onExport }: { onExport: () => void }) {
+type RightPanel = "adjust" | "moodboard";
+
+function Header({
+  onExport,
+  rightPanel,
+  setRightPanel,
+}: {
+  onExport: () => void;
+  rightPanel: RightPanel;
+  setRightPanel: (p: RightPanel) => void;
+}) {
   return (
     <header className="flex items-center justify-between px-4 h-11 border-b border-zinc-800 bg-zinc-950 shrink-0 z-10">
       <div className="flex items-center gap-3">
@@ -38,6 +49,33 @@ function Header({ onExport }: { onExport: () => void }) {
       </div>
 
       <div className="flex items-center gap-2">
+        {/* Right-panel toggle */}
+        <div className="flex items-center rounded border border-zinc-800 overflow-hidden text-[10px]">
+          <button
+            onClick={() => setRightPanel("adjust")}
+            className={`px-2.5 py-1 transition-colors ${
+              rightPanel === "adjust"
+                ? "bg-zinc-800 text-zinc-200"
+                : "text-zinc-600 hover:text-zinc-400"
+            }`}
+          >
+            Adjust
+          </button>
+          <button
+            onClick={() => setRightPanel("moodboard")}
+            className={`flex items-center gap-1 px-2.5 py-1 transition-colors ${
+              rightPanel === "moodboard"
+                ? "bg-zinc-800 text-zinc-200"
+                : "text-zinc-600 hover:text-zinc-400"
+            }`}
+          >
+            <Palette className="w-3 h-3" />
+            Moodboard
+          </button>
+        </div>
+
+        <div className="h-4 w-px bg-zinc-800" />
+
         <button
           onClick={onExport}
           className="text-xs px-3 py-1 rounded border border-zinc-700 text-zinc-400 hover:text-zinc-200 hover:border-zinc-600 transition-colors"
@@ -59,15 +97,20 @@ function WorkspaceInner() {
   const searchParams = useSearchParams();
   const sessionId = searchParams.get("session") ?? "";
   const [showExport, setShowExport] = useState(false);
+  const [rightPanel, setRightPanel] = useState<RightPanel>("adjust");
 
   return (
     <WorkspaceProvider sessionId={sessionId}>
       <div className="flex flex-col h-screen bg-zinc-950 text-zinc-200 overflow-hidden">
-        <Header onExport={() => setShowExport(true)} />
+        <Header
+          onExport={() => setShowExport(true)}
+          rightPanel={rightPanel}
+          setRightPanel={setRightPanel}
+        />
         <div className="flex flex-1 min-h-0">
           <ImageBrowser />
           <Canvas />
-          <AdjustmentPanel />
+          {rightPanel === "adjust" ? <AdjustmentPanel /> : <MoodboardPanel />}
         </div>
         <ReferenceStrip />
         <PromptBar />
