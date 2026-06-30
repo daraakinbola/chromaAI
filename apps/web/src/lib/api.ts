@@ -1,7 +1,9 @@
 import type {
+  AdjustmentState,
   BatchAdaptRequest,
   BatchAdaptResponse,
   ColorProfile,
+  MoodboardApplyRequest,
   MoodboardPipelineResult,
   PromptSubmitRequest,
   PromptSubmitResponse,
@@ -103,6 +105,11 @@ export const api = {
       request<MoodboardPipelineResult>("/moodboard/analyze", {
         method: "POST",
         body: JSON.stringify({ images, profiles }),
+      }),
+    apply: (req: MoodboardApplyRequest) =>
+      request<AdjustmentState>("/moodboard/apply", {
+        method: "POST",
+        body: JSON.stringify(req),
       }),
   },
 };

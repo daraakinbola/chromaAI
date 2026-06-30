@@ -14,6 +14,7 @@ from models.schemas import (
     PromptVariation,
     SessionGenre,
     ColorProfile,
+    DimensionConsensus,
     VisionAnalystOutput,
     MoodboardConsensus,
     CreativeDirectorOutput,
@@ -361,6 +362,89 @@ Respond with exactly this JSON structure:
         confidenceAssessment=data["confidenceAssessment"],
         recommendedWeight=float(data["recommendedWeight"]),
         flaggedTensions=data.get("flaggedTensions", []),
+    )
+
+
+_NEUTRAL_TEMPERATURE = 5500.0  # Kelvin — the default "no adjustment" baseline
+
+
+def _clamp(value: float, lo: float, hi: float) -> float:
+    return max(lo, min(hi, value))
+
+
+def _compute_tint_from_hue_vectors(
+    shadow_hue: list[DimensionConsensus],
+    highlight_hue: list[DimensionConsensus],
+) -> float:
+    """
+    Derive tint direction from shadow and highlight hue RGB consensus vectors.
+
+    Averages the two zones, then measures how much the G channel deviates from
+    the midpoint of R and B. A green cast (G > (R+B)/2) pushes tint positive;
+    a magenta cast pushes it negative. Scaled to the -150..+150 tint range.
+    """
+    avg_r = (shadow_hue[0].value + highlight_hue[0].value) / 2.0
+    avg_g = (shadow_hue[1].value + highlight_hue[1].value) / 2.0
+    avg_b = (shadow_hue[2].value + highlight_hue[2].value) / 2.0
+
+    rb_mid = (avg_r + avg_b) / 2.0
+    green_excess = avg_g - rb_mid  # positive = green cast, negative = magenta
+
+    # pixel range 0-255, max |green_excess| ≈ 128 → scale to ±150
+    return _clamp((green_excess / 128.0) * 150.0, -150.0, 150.0)
+
+
+def moodboard_consensus_to_adjustments(
+    consensus: MoodboardConsensus,
+    current_adjustments: Adjustments,
+    recommended_weight: float,
+) -> Adjustments:
+    """
+    Direct, deterministic mapping from MoodboardConsensus to AdjustmentState
+    (Section 4.1 of Phase 4b PRD).
+
+    Weight scales the delta from a fixed neutral baseline for each moodboard-
+    derived field, so repeated application always produces the same result
+    regardless of what the sliders were at (deterministic per PRD §6 AC4).
+
+    Fields not covered by the moodboard consensus (highlights, shadows, whites,
+    blacks, clarity, vibrance) are passed through from current_adjustments
+    unchanged — this is an application of direction, not a reset.
+    """
+    w = recommended_weight
+
+    # --- Moodboard-derived targets -------------------------------------------
+    target_temperature = consensus.averageTemperature.value
+    target_saturation  = _clamp((consensus.averageSaturation.value - 0.5) * 200.0, -100.0, 100.0)
+    target_contrast    = _clamp((consensus.contrastRatio.value - 4.0) * 15.0, -100.0, 100.0)
+    target_exposure    = consensus.exposureBias.value
+    target_tint        = _compute_tint_from_hue_vectors(consensus.shadowHue, consensus.highlightHue)
+
+    # --- Apply weight as delta from neutral baseline -------------------------
+    # Temperature is absolute (Kelvin), so delta is from neutral 5500K.
+    # All other fields are centred at 0, so their neutral baseline IS 0.
+    new_temperature = _clamp(
+        _NEUTRAL_TEMPERATURE + (target_temperature - _NEUTRAL_TEMPERATURE) * w,
+        2000.0, 50000.0,
+    )
+    new_saturation = _clamp(target_saturation * w, -100.0, 100.0)
+    new_contrast   = _clamp(target_contrast   * w, -100.0, 100.0)
+    new_exposure   = _clamp(target_exposure   * w, -5.0,    5.0)
+    new_tint       = _clamp(target_tint       * w, -150.0, 150.0)
+
+    return Adjustments(
+        temperature = new_temperature,
+        saturation  = new_saturation,
+        contrast    = new_contrast,
+        exposure    = new_exposure,
+        tint        = new_tint,
+        # Non-moodboard fields: preserved exactly from current image state
+        highlights  = current_adjustments.highlights,
+        shadows     = current_adjustments.shadows,
+        whites      = current_adjustments.whites,
+        blacks      = current_adjustments.blacks,
+        clarity     = current_adjustments.clarity,
+        vibrance    = current_adjustments.vibrance,
     )
 
 

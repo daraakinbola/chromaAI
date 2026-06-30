@@ -384,6 +384,12 @@ export interface MoodboardImage {
 
 export type MoodboardStage = "idle" | "vision" | "synthesizer" | "creative" | "done" | "error";
 
+export interface MoodboardApplyRequest {
+  consensus: MoodboardConsensus;
+  recommended_weight: number;
+  current_adjustments: AdjustmentState;
+}
+
 // ─── Session persistence (Section 7 of Phase 2 TechSpec) ─────────────────────
 
 export interface SessionRecord {

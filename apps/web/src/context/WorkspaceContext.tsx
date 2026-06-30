@@ -164,6 +164,7 @@ interface WorkspaceActions {
   sampleColorFromImage: (imageDataUrl: string, x: number, y: number, imageWidth: number, imageHeight: number) => Promise<number>;
   addMoodboardImage: (file: File) => Promise<void>;
   removeMoodboardImage: (id: string) => void;
+  applyMoodboard: () => Promise<void>;
 }
 
 const WorkspaceContext = createContext<(WorkspaceState & WorkspaceActions) | null>(null);
@@ -997,6 +998,33 @@ export function WorkspaceProvider({ children, sessionId }: WorkspaceProviderProp
     setMoodboardImages((prev) => prev.filter((img) => img.id !== id));
   };
 
+  const applyMoodboard = async () => {
+    if (!moodboardResult || !activeImageId) return;
+    const currentAdj = images.find((i) => i.id === activeImageId)?.adjustments ?? defaultAdjustmentState;
+    try {
+      const newAdj = await api.moodboard.apply({
+        consensus: moodboardResult.statisticalConsensus,
+        recommended_weight: moodboardResult.creativeDirection.recommendedWeight,
+        current_adjustments: currentAdj,
+      });
+      setImages((prev) =>
+        prev.map((img) =>
+          img.id === activeImageId ? { ...img, adjustments: { ...img.adjustments, ...newAdj } } : img
+        )
+      );
+      const pct = Math.round(moodboardResult.creativeDirection.recommendedWeight * 100);
+      addToast({
+        type: "success",
+        message: `Applied at ${pct}% strength based on board agreement`,
+      });
+    } catch (err) {
+      addToast({
+        type: "error",
+        message: err instanceof Error ? err.message : "Failed to apply moodboard",
+      });
+    }
+  };
+
   // ── References ────────────────────────────────────────────────────────────
 
   const importReference = async (file: File) => {
@@ -1124,6 +1152,7 @@ export function WorkspaceProvider({ children, sessionId }: WorkspaceProviderProp
         moodboardError,
         addMoodboardImage,
         removeMoodboardImage,
+        applyMoodboard,
       }}
     >
       {children}

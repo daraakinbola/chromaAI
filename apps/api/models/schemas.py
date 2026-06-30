@@ -137,6 +137,12 @@ class MoodboardPipelineResult(BaseModel):
     processingTimeMs: MoodboardProcessingTimes
 
 
+class MoodboardApplyRequest(BaseModel):
+    consensus: MoodboardConsensus
+    recommended_weight: float = Field(..., ge=0.0, le=1.0)
+    current_adjustments: Adjustments
+
+
 class PromptVariation(BaseModel):
     label: str
     interpretation: str

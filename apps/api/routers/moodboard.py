@@ -1,5 +1,6 @@
 from fastapi import APIRouter, HTTPException
 from models.schemas import (
+    Adjustments,
     VisionAnalystOutput,
     VisionAnalystTestRequest,
     MoodboardConsensus,
@@ -8,6 +9,7 @@ from models.schemas import (
     CreativeDirectorTestRequest,
     MoodboardAnalyzeRequest,
     MoodboardPipelineResult,
+    MoodboardApplyRequest,
 )
 from services import ai_engine
 from services.statistical_synthesizer import compute_moodboard_consensus
@@ -85,3 +87,23 @@ async def analyze_moodboard(req: MoodboardAnalyzeRequest) -> MoodboardPipelineRe
         raise HTTPException(503, str(exc)) from exc
     except Exception as exc:
         raise HTTPException(500, f"Moodboard pipeline error: {exc}") from exc
+
+
+@router.post("/apply", response_model=Adjustments)
+def apply_moodboard(req: MoodboardApplyRequest) -> Adjustments:
+    """
+    Translate MoodboardConsensus → AdjustmentState (Phase 4b PRD §4.1–4.2).
+
+    Deterministic, no AI call. Each moodboard-derived field is scaled from its
+    neutral baseline by recommended_weight. Fields the moodboard doesn't cover
+    (highlights, shadows, whites, blacks, clarity, vibrance) are passed through
+    unchanged from current_adjustments.
+    """
+    try:
+        return ai_engine.moodboard_consensus_to_adjustments(
+            req.consensus,
+            req.current_adjustments,
+            req.recommended_weight,
+        )
+    except Exception as exc:
+        raise HTTPException(500, f"Moodboard apply error: {exc}") from exc

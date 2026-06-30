@@ -1,9 +1,8 @@
 "use client";
 
-import { useCallback, useRef } from "react";
-import { X, Upload, AlertTriangle, ChevronDown } from "lucide-react";
+import { useCallback, useRef, useState } from "react";
+import { X, Upload, AlertTriangle, ChevronDown, Wand2 } from "lucide-react";
 import { clsx } from "clsx";
-import { useState } from "react";
 import { useWorkspace } from "@/context/WorkspaceContext";
 import type { MoodboardImage, VisionAnalystOutput, MoodboardConsensus } from "@/types";
 
@@ -245,7 +244,19 @@ export function MoodboardPanel() {
     moodboardResult,
     moodboardStage,
     moodboardError,
+    applyMoodboard,
+    activeImageId,
   } = useWorkspace();
+  const [isApplying, setIsApplying] = useState(false);
+
+  const handleApply = async () => {
+    setIsApplying(true);
+    try {
+      await applyMoodboard();
+    } finally {
+      setIsApplying(false);
+    }
+  };
 
   const isRunning = moodboardStage === "vision" || moodboardStage === "synthesizer" || moodboardStage === "creative";
   const result = moodboardResult;
@@ -337,6 +348,27 @@ export function MoodboardPanel() {
                 {Math.round(result.creativeDirection.recommendedWeight * 100)}%
               </span>
             </div>
+
+            {/* Apply button */}
+            <button
+              onClick={() => void handleApply()}
+              disabled={isApplying || !activeImageId}
+              className={clsx(
+                "flex items-center justify-center gap-1.5 w-full py-2 rounded-lg text-[11px] font-medium transition-colors",
+                isApplying || !activeImageId
+                  ? "bg-zinc-800 text-zinc-600 cursor-not-allowed"
+                  : "bg-chroma-600 hover:bg-chroma-500 text-white"
+              )}
+            >
+              <Wand2 className="w-3.5 h-3.5" />
+              {isApplying ? "Applying…" : "Apply this direction"}
+            </button>
+
+            {!activeImageId && (
+              <p className="text-[9px] text-zinc-600 text-center -mt-1">
+                Select an image first
+              </p>
+            )}
 
             {/* Flagged tensions callout — only when non-empty */}
             {result.creativeDirection.flaggedTensions.length > 0 && (
