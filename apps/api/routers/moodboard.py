@@ -4,6 +4,8 @@ from models.schemas import (
     VisionAnalystTestRequest,
     MoodboardConsensus,
     SynthesizerTestRequest,
+    CreativeDirectorOutput,
+    CreativeDirectorTestRequest,
 )
 from services import ai_engine
 from services.statistical_synthesizer import compute_moodboard_consensus
@@ -41,3 +43,19 @@ def test_statistical_synthesizer(req: SynthesizerTestRequest) -> MoodboardConsen
         raise HTTPException(400, str(exc)) from exc
     except Exception as exc:
         raise HTTPException(500, f"Synthesizer error: {exc}") from exc
+
+
+@router.post("/test-creative-director", response_model=CreativeDirectorOutput)
+async def test_creative_director(req: CreativeDirectorTestRequest) -> CreativeDirectorOutput:
+    """
+    Smoke-test for the Creative Director agent in isolation.
+    Accepts pre-computed Vision Analyst outputs + Statistical Synthesizer consensus;
+    returns a unified creative brief, tension flags, and recommended weight.
+    Not wired into the full pipeline yet.
+    """
+    try:
+        return await ai_engine.run_creative_director(req.vision_results, req.consensus)
+    except EnvironmentError as exc:
+        raise HTTPException(503, str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(500, f"Creative Director error: {exc}") from exc

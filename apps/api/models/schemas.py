@@ -107,6 +107,18 @@ class SynthesizerTestRequest(BaseModel):
     profiles: list[ColorProfile] = Field(..., min_length=2)
 
 
+class CreativeDirectorOutput(BaseModel):
+    creativeBrief: str
+    confidenceAssessment: str
+    recommendedWeight: float = Field(..., ge=0.0, le=1.0)
+    flaggedTensions: list[str]
+
+
+class CreativeDirectorTestRequest(BaseModel):
+    vision_results: list[VisionAnalystOutput] = Field(..., min_length=1)
+    consensus: MoodboardConsensus
+
+
 class PromptVariation(BaseModel):
     label: str
     interpretation: str
