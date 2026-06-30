@@ -3,6 +3,7 @@ AI engine — orchestrates Claude for prompt parsing and scene analysis.
 """
 import os
 import json
+import asyncio
 from anthropic import AsyncAnthropic
 from models.schemas import (
     Adjustments,
@@ -11,6 +12,7 @@ from models.schemas import (
     PromptSubmitResponse,
     PromptVariation,
     SessionGenre,
+    VisionAnalystOutput,
 )
 
 def _client() -> AsyncAnthropic:
@@ -116,6 +118,98 @@ AMBIGUITY RULES — apply exactly one of these three paths:
         clarification_question=data.get("clarification_question"),
         variations=variations,
     )
+
+
+def _parse_data_url(data_url: str) -> tuple[str, str]:
+    """Split a data URL into (media_type, base64_data)."""
+    header, data = data_url.split(",", 1)
+    media_type = header.split(";")[0].replace("data:", "")
+    return media_type, data
+
+
+VISION_ANALYST_SYSTEM = """\
+You are the Vision Analyst for ChromaAI's moodboard intelligence pipeline.
+Your only job is to look at an image and describe what it visually communicates
+and how it achieves its look.
+
+Rules — follow these exactly:
+1. Describe what you SEE, not what color grading values to use. Do not mention
+   exposure, contrast, temperature, or any numeric adjustment parameter.
+   Translation to grading values is handled by a separate agent, not you.
+2. Distinguish CONTENT (what is literally in the frame — subject, setting,
+   light source) from STYLE (how it is rendered — grain, tonal character,
+   color treatment). Address both, separately, in your output.
+3. styleReferences must only list influences you genuinely recognize — specific
+   film stocks, photographic genres, cinematographic eras, or named visual
+   styles. If you are uncertain, omit the reference entirely. An empty array
+   is correct and preferred over a fabricated or guessed reference.
+   False specificity is worse than honest generality.
+4. Respond ONLY with a valid JSON object — no prose, no markdown fences.
+"""
+
+VISION_ANALYST_USER = """\
+Analyze this moodboard image.
+
+Respond with exactly this JSON structure:
+{
+  "description": "2-3 sentences covering the subject matter, quality of light, and overall emotional mood",
+  "technicalCharacter": "comma-separated style descriptors as a colorist would name them — e.g. 'film grain, lifted blacks, warm highlight rolloff, desaturated midtones'",
+  "styleReferences": ["only genuine recognized influences — omit any you are not confident about; empty array is fine"],
+  "confidence": 0.9
+}
+"""
+
+
+async def run_vision_analyst(image_data_url: str) -> VisionAnalystOutput:
+    """
+    Vision Analyst agent — looks at a single moodboard image and returns a
+    qualitative description of its content and visual style.
+
+    Section 3.3 contract: describes what it sees, never suggests adjustment
+    values, never fabricates style references it isn't genuinely recognizing.
+    """
+    media_type, b64_data = _parse_data_url(image_data_url)
+
+    response = await _client().messages.create(
+        model="claude-sonnet-4-6",
+        max_tokens=512,
+        system=VISION_ANALYST_SYSTEM,
+        messages=[
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "image",
+                        "source": {
+                            "type": "base64",
+                            "media_type": media_type,
+                            "data": b64_data,
+                        },
+                    },
+                    {"type": "text", "text": VISION_ANALYST_USER},
+                ],
+            }
+        ],
+    )
+
+    raw = response.content[0].text.strip()
+    if raw.startswith("```"):
+        raw = raw.split("```")[1]
+        if raw.startswith("json"):
+            raw = raw[4:]
+    data = json.loads(raw)
+
+    return VisionAnalystOutput(
+        description=data["description"],
+        technicalCharacter=data["technicalCharacter"],
+        styleReferences=data.get("styleReferences", []),
+        confidence=float(data["confidence"]),
+    )
+
+
+async def run_vision_analyst_batch(image_data_urls: list[str]) -> list[VisionAnalystOutput]:
+    """Run Vision Analyst concurrently across all images (Section 3.4)."""
+    return await asyncio.gather(*[run_vision_analyst(url) for url in image_data_urls])
 
 
 async def analyze_scene(image_b64: str, genre: SessionGenre | None = None) -> SceneAnalysis:

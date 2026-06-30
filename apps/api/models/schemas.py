@@ -52,6 +52,19 @@ class PromptSubmitRequest(BaseModel):
     current_adjustments: Optional[Adjustments] = None
 
 
+# ── Moodboard pipeline (Phase 4) ──────────────────────────────────────────────
+
+class VisionAnalystOutput(BaseModel):
+    description: str
+    technicalCharacter: str
+    styleReferences: list[str]
+    confidence: float = Field(..., ge=0.0, le=1.0)
+
+
+class VisionAnalystTestRequest(BaseModel):
+    image_data_url: str
+
+
 class PromptVariation(BaseModel):
     label: str
     interpretation: str
