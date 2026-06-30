@@ -4,7 +4,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Pipette, RotateCcw } from "lucide-react";
 import { clsx } from "clsx";
 import { useWorkspace } from "@/context/WorkspaceContext";
-import { buildCurveLUT, computeHistogram, parametricToPoints } from "@/lib/curveMath";
+import { buildSvgPath, computeHistogram, parametricToPoints } from "@/lib/curveMath";
 import type { CurveChannel, ToneCurve } from "@/types";
 
 // ─── Presets ──────────────────────────────────────────────────────────────────
@@ -73,17 +73,11 @@ export function ToneCurveEditor() {
     ? parametricToPoints(curve.parametric)
     : curve.points;
 
-  // ── Curve path from LUT (memoised, rebuilds when pts change) ────────────────
-  const lut = useMemo(() => buildCurveLUT(pts), [pts]);
-
-  const pathD = useMemo(() => {
-    let d = "";
-    for (let x = 0; x < 256; x++) {
-      const sy = 255 - Math.round(lut[x] * 255);
-      d += `${x === 0 ? "M" : "L"}${x},${sy}`;
-    }
-    return d;
-  }, [lut]);
+  // ── Curve path via bezier-js cubic segments (PRD §7) ────────────────────────
+  // buildSvgPath generates proper SVG C commands from the control points using
+  // the same monotone Hermite tangents as the LUT, but expressed as true cubic
+  // bezier segments rather than 256 line segments.
+  const pathD = useMemo(() => buildSvgPath(pts), [pts]);
 
   // ── Histogram path ───────────────────────────────────────────────────────────
   const histPath = useMemo(() => {

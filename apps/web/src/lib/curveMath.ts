@@ -1,3 +1,4 @@
+import { Bezier } from "bezier-js";
 import type { CurveState, ToneCurve, ParametricCurve } from "@/types";
 
 // ─── LUT builder — monotone cubic Hermite interpolation (Fritsch-Carlson) ────
@@ -72,6 +73,74 @@ export function buildCurveLUT(points: [number, number][]): Float32Array {
   }
 
   return lut;
+}
+
+// ─── SVG path builder using bezier-js cubic segments ─────────────────────────
+// Converts control points to a smooth SVG cubic-bezier path using the same
+// monotone Fritsch-Carlson tangents as buildCurveLUT, expressed as proper
+// SVG C commands via bezier-js. Replaces the 256-point polyline in the
+// ToneCurveEditor SVG canvas (PRD §7 — bezier-js integration).
+
+function _tangents(sorted: [number, number][]): number[] {
+  const n = sorted.length;
+  const xs = sorted.map((p) => p[0]);
+  const ys = sorted.map((p) => p[1]);
+  const d: number[] = [];
+  for (let i = 0; i < n - 1; i++) d[i] = (ys[i + 1] - ys[i]) / (xs[i + 1] - xs[i]);
+  const m: number[] = new Array(n);
+  m[0] = d[0];
+  m[n - 1] = d[n - 2];
+  for (let i = 1; i < n - 1; i++) m[i] = (d[i - 1] + d[i]) / 2;
+  for (let i = 0; i < n - 1; i++) {
+    if (Math.abs(d[i]) < 1e-10) { m[i] = 0; m[i + 1] = 0; continue; }
+    const a = m[i] / d[i], b = m[i + 1] / d[i];
+    const s = a * a + b * b;
+    if (s > 9) { const tau = 3 / Math.sqrt(s); m[i] = tau * a * d[i]; m[i + 1] = tau * b * d[i]; }
+  }
+  return m;
+}
+
+/**
+ * Builds an SVG path string for the tone curve using cubic bezier segments.
+ * Each segment uses bezier-js to compute the true cubic bezier representation
+ * of the Hermite spline so the <path> element carries proper C commands instead
+ * of 256 L segments.
+ *
+ * Coordinate system: SVG y=0 is top, curve y=0 is bottom, so we flip: svg_y = 255 - curve_y.
+ */
+export function buildSvgPath(points: [number, number][]): string {
+  const sorted = [...points].sort((a, b) => a[0] - b[0]);
+  if (sorted.length < 2) return "M0,255 L255,0";
+
+  const flip = (y: number) => 255 - y;
+  const n = sorted.length;
+  const m = _tangents(sorted);
+
+  let d = `M${sorted[0][0]},${flip(sorted[0][1])}`;
+  for (let i = 0; i < n - 1; i++) {
+    const [x0, y0] = sorted[i];
+    const [x1, y1] = sorted[i + 1];
+    const h = x1 - x0;
+    const cp1x = x0 + h / 3;
+    const cp1y = y0 + m[i] * h / 3;
+    const cp2x = x1 - h / 3;
+    const cp2y = y1 - m[i + 1] * h / 3;
+
+    // bezier-js computes the cubic and toSVG() returns "M x y C cp1x cp1y cp2x cp2y ex ey".
+    // We only need the C segment (skip M since we already have the start point).
+    const bez = new Bezier(
+      { x: x0,   y: flip(y0)   },
+      { x: cp1x, y: flip(cp1y) },
+      { x: cp2x, y: flip(cp2y) },
+      { x: x1,   y: flip(y1)   },
+    );
+    const svg = bez.toSVG();
+    // svg = "M x0 y0 C cp1x cp1y cp2x cp2y x1 y1"
+    // Strip the leading "M x y " (first 3 space-separated tokens) to get just "C ..."
+    const cCmd = svg.split(" ").slice(3).join(" ");
+    d += " " + cCmd;
+  }
+  return d;
 }
 
 // ─── Parametric → control points ─────────────────────────────────────────────

@@ -12,6 +12,7 @@
     "build:web": "npm run build --workspace=apps/web"
   },
   "devDependencies": {
+    "@playwright/test": "^1.61.1",
     "concurrently": "^9.1.0"
   }
 }

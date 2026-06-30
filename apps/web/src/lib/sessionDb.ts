@@ -1,59 +1,37 @@
-import { openDB, type IDBPDatabase } from "idb";
+import { createStore, get, set, del, values } from "idb-keyval";
 import type { SessionRecord } from "@/types";
 import { defaultCurveState } from "@/types";
 
-const DB_NAME = "chromaai-sessions";
-const DB_VERSION = 1;
-const STORE = "sessions";
 const THIRTY_DAYS_MS = 30 * 24 * 60 * 60 * 1000;
 
-let dbPromise: Promise<IDBPDatabase> | null = null;
-
-function getDb(): Promise<IDBPDatabase> {
-  if (!dbPromise) {
-    dbPromise = openDB(DB_NAME, DB_VERSION, {
-      upgrade(db) {
-        const store = db.createObjectStore(STORE, { keyPath: "id" });
-        store.createIndex("updatedAt", "updatedAt");
-      },
-    });
-  }
-  return dbPromise;
-}
+// Named store so idb-keyval coexists with any other IndexedDB usage in the app.
+const sessionStore = createStore("chromaai-sessions", "sessions");
 
 export async function saveSession(session: SessionRecord): Promise<void> {
-  const db = await getDb();
-  await db.put(STORE, session);
+  await set(session.id, session, sessionStore);
 }
 
 export async function getSession(id: string): Promise<SessionRecord | undefined> {
-  const db = await getDb();
-  return db.get(STORE, id);
+  return get<SessionRecord>(id, sessionStore);
 }
 
 export async function listSessions(): Promise<SessionRecord[]> {
-  const db = await getDb();
-  const all: SessionRecord[] = await db.getAll(STORE);
+  const all = await values<SessionRecord>(sessionStore);
   const cutoff = Date.now() - THIRTY_DAYS_MS;
-  return all
-    .filter((s) => s.updatedAt >= cutoff)
+  return (all as SessionRecord[])
+    .filter((s) => s?.updatedAt >= cutoff)
     .sort((a, b) => b.updatedAt - a.updatedAt);
 }
 
 export async function deleteExpiredSessions(): Promise<void> {
-  const db = await getDb();
-  const all: SessionRecord[] = await db.getAll(STORE);
+  const all = await values<SessionRecord>(sessionStore);
   const cutoff = Date.now() - THIRTY_DAYS_MS;
-  const expired = all.filter((s) => s.updatedAt < cutoff);
-  if (!expired.length) return;
-  const tx = db.transaction(STORE, "readwrite");
-  await Promise.all(expired.map((s) => tx.store.delete(s.id)));
-  await tx.done;
+  const expired = (all as SessionRecord[]).filter((s) => s?.updatedAt < cutoff);
+  await Promise.all(expired.map((s) => del(s.id, sessionStore)));
 }
 
 export async function deleteSession(id: string): Promise<void> {
-  const db = await getDb();
-  await db.delete(STORE, id);
+  await del(id, sessionStore);
 }
 
 export async function createSession(
