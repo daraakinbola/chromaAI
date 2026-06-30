@@ -52,6 +52,12 @@ class PromptSubmitRequest(BaseModel):
     current_adjustments: Optional[Adjustments] = None
 
 
+class PromptVariation(BaseModel):
+    label: str
+    interpretation: str
+    adjustments: Adjustments
+
+
 class PromptSubmitResponse(BaseModel):
     interpretation: str
     suggested_adjustments: Adjustments
@@ -59,6 +65,7 @@ class PromptSubmitResponse(BaseModel):
     flagged_ambiguity: Optional[str] = None
     requires_clarification: bool = False
     clarification_question: Optional[str] = None
+    variations: Optional[list[PromptVariation]] = None
 
 
 class ApplyGradeRequest(BaseModel):

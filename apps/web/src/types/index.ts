@@ -176,6 +176,12 @@ export interface PromptSubmitRequest {
   current_adjustments?: AdjustmentState | null;
 }
 
+export interface PromptVariation {
+  label: string;
+  interpretation: string;
+  adjustments: AdjustmentState;
+}
+
 // Mirrors PromptSubmitResponse in apps/api/models/schemas.py
 export interface PromptSubmitResponse {
   interpretation: string;
@@ -184,6 +190,7 @@ export interface PromptSubmitResponse {
   flagged_ambiguity: string | null;
   requires_clarification: boolean;
   clarification_question: string | null;
+  variations: PromptVariation[] | null;
 }
 
 // ─── Reference images (Section 4.3 of Phase 2 TechSpec) ─────────────────────

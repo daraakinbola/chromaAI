@@ -82,6 +82,7 @@ interface WorkspaceState {
   lastInterpretation: string | null;
   clarificationQuestion: string | null;
   promptError: string | null;
+  pendingVariations: import("@/types").PromptVariation[] | null;
   toasts: ToastItem[];
   batchConsistencyScore: number;
   isApplyingGrade: boolean;
@@ -125,6 +126,8 @@ interface WorkspaceActions {
   setViewMode: (mode: ViewMode) => void;
   submitPrompt: (text: string) => Promise<void>;
   dismissInterpretation: () => void;
+  selectVariation: (variation: import("@/types").PromptVariation) => void;
+  dismissVariations: () => void;
   importReference: (file: File) => Promise<void>;
   removeReference: (id: string) => void;
   setReferenceWeight: (id: string, weight: number) => void;
@@ -190,6 +193,7 @@ export function WorkspaceProvider({ children, sessionId }: WorkspaceProviderProp
   const [lastInterpretation, setLastInterpretation] = useState<string | null>(null);
   const [clarificationQuestion, setClarificationQuestion] = useState<string | null>(null);
   const [promptError, setPromptError] = useState<string | null>(null);
+  const [pendingVariations, setPendingVariations] = useState<import("@/types").PromptVariation[] | null>(null);
   const [toasts, setToasts] = useState<ToastItem[]>([]);
   const [batchConsistencyScore, setBatchConsistencyScore] = useState(100);
   const [isApplyingGrade, setIsApplyingGrade] = useState(false);
@@ -546,7 +550,21 @@ export function WorkspaceProvider({ children, sessionId }: WorkspaceProviderProp
     if (type === "brush") {
       return { maskPng: createEmptyMaskPng(w, h), maskWidth: w, maskHeight: h };
     }
-    // subject / sky / background — API call
+    // subject / sky / background — try @xenova/transformers in maskWorker first
+    // (client-side, no network latency after first model download, PRD §7).
+    // Fall back to the FastAPI segmentation endpoint if the worker is unavailable
+    // or the model fails to load.
+    const segWorker = getMaskWorker();
+    if (segWorker) {
+      try {
+        const maskPng = await segWorker.generateSegmentationMaskPng(
+          imageDataUrl, w, h, type as "subject" | "sky" | "background", 0, false,
+        );
+        return { maskPng, maskWidth: w, maskHeight: h };
+      } catch (workerErr) {
+        console.warn("[ChromaAI] Worker segmentation failed, falling back to API:", workerErr);
+      }
+    }
     const apiMethod = type === "subject" ? api.masks.subject
       : type === "sky" ? api.masks.sky
       : api.masks.background;
@@ -821,6 +839,7 @@ export function WorkspaceProvider({ children, sessionId }: WorkspaceProviderProp
     setIsAnalyzing(true);
     setPromptError(null);
     setClarificationQuestion(null);
+    setPendingVariations(null);
 
     try {
       const response = await api.prompt.submit({
@@ -836,23 +855,22 @@ export function WorkspaceProvider({ children, sessionId }: WorkspaceProviderProp
         text,
         timestamp: Date.now(),
         confidence: response.confidence,
-        applied: !response.requires_clarification,
+        applied: !response.requires_clarification && !response.variations?.length,
       };
 
       setAiConfidence(response.confidence);
       setLastInterpretation(response.interpretation);
       setPromptHistory((prev) => [entry, ...prev]);
 
-      if (response.requires_clarification) {
+      if (response.variations?.length) {
+        setPendingVariations(response.variations);
+      } else if (response.requires_clarification) {
         setClarificationQuestion(response.clarification_question);
       } else if (activeImageId) {
         setImages((prev) =>
           prev.map((img) =>
             img.id === activeImageId
-              ? {
-                  ...img,
-                  adjustments: { ...img.adjustments, ...response.suggested_adjustments },
-                }
+              ? { ...img, adjustments: { ...img.adjustments, ...response.suggested_adjustments } }
               : img
           )
         );
@@ -867,6 +885,21 @@ export function WorkspaceProvider({ children, sessionId }: WorkspaceProviderProp
   };
 
   const dismissInterpretation = () => setLastInterpretation(null);
+
+  const selectVariation = (variation: import("@/types").PromptVariation) => {
+    if (!activeImageId) return;
+    setImages((prev) =>
+      prev.map((img) =>
+        img.id === activeImageId
+          ? { ...img, adjustments: { ...img.adjustments, ...variation.adjustments } }
+          : img
+      )
+    );
+    setLastInterpretation(variation.interpretation);
+    setPendingVariations(null);
+  };
+
+  const dismissVariations = () => setPendingVariations(null);
 
   // ── References ────────────────────────────────────────────────────────────
 
@@ -932,6 +965,7 @@ export function WorkspaceProvider({ children, sessionId }: WorkspaceProviderProp
         lastInterpretation,
         clarificationQuestion,
         promptError,
+        pendingVariations,
         toasts,
         batchConsistencyScore,
         isApplyingGrade,
@@ -964,6 +998,8 @@ export function WorkspaceProvider({ children, sessionId }: WorkspaceProviderProp
         setViewMode,
         submitPrompt,
         dismissInterpretation,
+        selectVariation,
+        dismissVariations,
         importReference,
         removeReference,
         setReferenceWeight,

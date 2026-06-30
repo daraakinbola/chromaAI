@@ -9,6 +9,7 @@ from models.schemas import (
     SceneAnalysis,
     PromptSubmitRequest,
     PromptSubmitResponse,
+    PromptVariation,
     SessionGenre,
 )
 
@@ -42,12 +43,7 @@ async def parse_prompt(request: PromptSubmitRequest) -> PromptSubmitResponse:
     if request.current_adjustments:
         context_parts.append(f"Current adjustments: {request.current_adjustments.model_dump_json()}")
 
-    user_message = "\n".join(context_parts) + """
-
-Respond with a JSON object with these fields:
-{
-  "interpretation": "Plain-English description of how you interpreted the prompt",
-  "suggested_adjustments": {
+    adj_schema = """{
     "exposure": 0.0,       // -5 to +5 stops
     "contrast": 0,         // -100 to +100
     "highlights": 0,       // -100 to +100
@@ -59,27 +55,57 @@ Respond with a JSON object with these fields:
     "saturation": 0,       // -100 to +100
     "temperature": 5500,   // Kelvin
     "tint": 0              // -150 to +150
-  },
-  "confidence": 0.85,       // 0.0 to 1.0
-  "flagged_ambiguity": null, // string or null
+  }"""
+
+    user_message = "\n".join(context_parts) + f"""
+
+Respond with a JSON object with these fields:
+{{
+  "interpretation": "Plain-English description of how you interpreted the prompt",
+  "suggested_adjustments": {adj_schema},
+  "confidence": 0.85,        // 0.0 to 1.0
+  "flagged_ambiguity": null, // string describing the ambiguity, or null
   "requires_clarification": false,
-  "clarification_question": null
-}"""
+  "clarification_question": null,
+  "variations": null
+}}
+
+AMBIGUITY RULES — apply exactly one of these three paths:
+1. confidence >= 0.65: Set variations=null. Apply your best interpretation directly.
+2. confidence < 0.65 AND a single question would resolve the ambiguity: Set requires_clarification=true, write clarification_question, set variations=null.
+3. confidence < 0.65 AND multiple interpretations are equally plausible: Set variations to an array of 2-3 objects — do NOT set requires_clarification. Each variation:
+   {{
+     "label": "Short name (2-4 words)",
+     "interpretation": "One sentence describing this reading of the prompt",
+     "adjustments": {adj_schema}
+   }}
+   Make the variations meaningfully distinct (e.g. warm vs cool, subtle vs dramatic).
+   suggested_adjustments should be your best-guess fallback for this case."""
 
     response = await _client().messages.create(
         model="claude-sonnet-4-6",
-        max_tokens=1024,
+        max_tokens=2048,
         system=SYSTEM_PROMPT,
         messages=[{"role": "user", "content": user_message}],
     )
 
     raw = response.content[0].text.strip()
-    # Strip markdown code fences if present
     if raw.startswith("```"):
         raw = raw.split("```")[1]
         if raw.startswith("json"):
             raw = raw[4:]
     data = json.loads(raw)
+
+    variations = None
+    if data.get("variations"):
+        variations = [
+            PromptVariation(
+                label=v["label"],
+                interpretation=v["interpretation"],
+                adjustments=Adjustments(**v["adjustments"]),
+            )
+            for v in data["variations"]
+        ]
 
     return PromptSubmitResponse(
         interpretation=data["interpretation"],
@@ -88,6 +114,7 @@ Respond with a JSON object with these fields:
         flagged_ambiguity=data.get("flagged_ambiguity"),
         requires_clarification=data.get("requires_clarification", False),
         clarification_question=data.get("clarification_question"),
+        variations=variations,
     )
 
 
